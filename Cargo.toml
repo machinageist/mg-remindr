@@ -1,0 +1,33 @@
+[package]
+name = "mg-todo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Bootstrap for a planned local-first todo authority"
+
+[lib]
+name = "mg_todo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mg-todo"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+toml = "0.9"
+url = "2"
+uuid = { version = "1", features = ["serde", "v7"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
