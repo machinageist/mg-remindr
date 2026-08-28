@@ -235,6 +235,21 @@ impl Project {
     pub fn name(&self) -> &str {
         &self.name
     }
+    pub const fn id(&self) -> ProjectId {
+        self.id
+    }
+    pub const fn lifecycle(&self) -> Lifecycle {
+        self.lifecycle
+    }
+    pub const fn version(&self) -> Version {
+        self.version
+    }
+    pub const fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+    pub const fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
+    }
 }
 impl Tag {
     pub fn new(
