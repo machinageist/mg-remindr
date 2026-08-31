@@ -16,6 +16,8 @@ pub enum DomainError {
     VersionOverflow,
     #[error("invalid lifecycle transition")]
     InvalidLifecycle,
+    #[error("updated_at must not be earlier than created_at")]
+    InvalidTimestamps,
 }
 macro_rules! id {
     ($name:ident, $kind:literal) => {
@@ -223,6 +225,9 @@ impl Project {
         created_at: DateTime<Utc>,
         updated_at: DateTime<Utc>,
     ) -> Result<Self, DomainError> {
+        if updated_at < created_at {
+            return Err(DomainError::InvalidTimestamps);
+        }
         Ok(Self {
             id,
             name: valid_text(&name, "project name")?,
@@ -259,6 +264,9 @@ impl Tag {
         created_at: DateTime<Utc>,
         updated_at: DateTime<Utc>,
     ) -> Result<Self, DomainError> {
+        if updated_at < created_at {
+            return Err(DomainError::InvalidTimestamps);
+        }
         Ok(Self {
             id,
             name: valid_text(&name, "tag name")?,
@@ -269,6 +277,18 @@ impl Tag {
     }
     pub fn name(&self) -> &str {
         &self.name
+    }
+    pub const fn id(&self) -> TagId {
+        self.id
+    }
+    pub const fn version(&self) -> Version {
+        self.version
+    }
+    pub const fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+    pub const fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
     }
 }
 impl Todo {
@@ -285,6 +305,9 @@ impl Todo {
         created_at: DateTime<Utc>,
         updated_at: DateTime<Utc>,
     ) -> Result<Self, DomainError> {
+        if updated_at < created_at {
+            return Err(DomainError::InvalidTimestamps);
+        }
         Ok(Self {
             id,
             title: valid_text(&title, "todo title")?,
@@ -300,6 +323,33 @@ impl Todo {
     }
     pub fn title(&self) -> &str {
         &self.title
+    }
+    pub const fn id(&self) -> TodoId {
+        self.id
+    }
+    pub const fn project_id(&self) -> Option<ProjectId> {
+        self.project_id
+    }
+    pub const fn parent_id(&self) -> Option<TodoId> {
+        self.parent_id
+    }
+    pub fn tag_ids(&self) -> &[TagId] {
+        &self.tag_ids
+    }
+    pub fn dependency_ids(&self) -> &[TodoId] {
+        &self.dependency_ids
+    }
+    pub const fn lifecycle(&self) -> Lifecycle {
+        self.lifecycle
+    }
+    pub const fn version(&self) -> Version {
+        self.version
+    }
+    pub const fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+    pub const fn updated_at(&self) -> DateTime<Utc> {
+        self.updated_at
     }
 }
 
@@ -334,6 +384,79 @@ mod tests {
         let id = TodoId::new();
         let json = format!(
             r#"{{"id":"{id}","title":"\n","project_id":null,"parent_id":null,"tag_ids":[],"dependency_ids":[],"lifecycle":"open","version":1,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
+        );
+        assert!(serde_json::from_str::<Todo>(&json).is_err());
+    }
+    #[test]
+    fn tags_reject_invalid_text_and_timestamp_history() {
+        let created_at = "2026-01-02T00:00:00Z".parse().unwrap();
+        let earlier = "2026-01-01T00:00:00Z".parse().unwrap();
+        assert!(matches!(
+            Tag::new(
+                TagId::new(),
+                "\n".to_owned(),
+                Version::new(),
+                created_at,
+                created_at
+            ),
+            Err(DomainError::InvalidText { field: "tag name" })
+        ));
+        assert_eq!(
+            Tag::new(
+                TagId::new(),
+                "tag".to_owned(),
+                Version::new(),
+                created_at,
+                earlier,
+            ),
+            Err(DomainError::InvalidTimestamps)
+        );
+    }
+
+    #[test]
+    fn projects_reject_backward_timestamp_history_in_constructor_and_serde() {
+        let created_at = "2026-01-02T00:00:00Z".parse().unwrap();
+        let earlier = "2026-01-01T00:00:00Z".parse().unwrap();
+        assert_eq!(
+            Project::new(
+                ProjectId::new(),
+                "project".to_owned(),
+                Lifecycle::Open,
+                Version::new(),
+                created_at,
+                earlier,
+            ),
+            Err(DomainError::InvalidTimestamps)
+        );
+        let id = ProjectId::new();
+        let json = format!(
+            r#"{{"id":"{id}","name":"project","lifecycle":"open","version":1,"created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
+        );
+        assert!(serde_json::from_str::<Project>(&json).is_err());
+    }
+
+    #[test]
+    fn todos_reject_backward_timestamp_history_in_constructor_and_serde() {
+        let created_at = "2026-01-02T00:00:00Z".parse().unwrap();
+        let earlier = "2026-01-01T00:00:00Z".parse().unwrap();
+        assert_eq!(
+            Todo::new(
+                TodoId::new(),
+                "todo".to_owned(),
+                None,
+                None,
+                vec![],
+                vec![],
+                Lifecycle::Open,
+                Version::new(),
+                created_at,
+                earlier,
+            ),
+            Err(DomainError::InvalidTimestamps)
+        );
+        let id = TodoId::new();
+        let json = format!(
+            r#"{{"id":"{id}","title":"todo","project_id":null,"parent_id":null,"tag_ids":[],"dependency_ids":[],"lifecycle":"open","version":1,"created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
         );
         assert!(serde_json::from_str::<Todo>(&json).is_err());
     }

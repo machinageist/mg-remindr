@@ -91,6 +91,7 @@ fn project(lifecycle: Lifecycle, version: u64) -> Project {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn disposable_postgres_proves_migrations_and_optimistic_project_writes() {
     if !Config::integration_tests_enabled() {
         return;
@@ -136,6 +137,26 @@ async fn disposable_postgres_proves_migrations_and_optimistic_project_writes() {
         Some(completed.clone())
     );
 
+    let backward = Project::new(
+        completed.id(),
+        "Backward timestamp".to_owned(),
+        Lifecycle::Open,
+        completed.version().next().unwrap(),
+        completed.created_at(),
+        completed.updated_at() - chrono::Duration::seconds(1),
+    )
+    .unwrap();
+    assert_eq!(
+        repository.replace(completed.version(), &backward).await,
+        Err(StorageError::InvalidReplacement {
+            reason: "updated_at must not move backward"
+        })
+    );
+    assert_eq!(
+        repository.find(completed.id()).await.unwrap(),
+        Some(completed.clone())
+    );
+
     let invalid = project(Lifecycle::Trashed, 3);
     assert!(matches!(
         repository.replace(completed.version(), &invalid).await,
@@ -174,8 +195,9 @@ async fn disposable_postgres_proves_migrations_and_optimistic_project_writes() {
     });
     client
         .execute(
-            "INSERT INTO mg_todo_schema_migrations (version, name) VALUES ($1, $2)",
-            &[&99_i64, &"future_schema"],
+            "INSERT INTO mg_todo_schema_migrations (version, name, checksum) \
+             VALUES ($1, $2, $3)",
+            &[&99_i64, &"future_schema", &"unknown"],
         )
         .await
         .unwrap();
