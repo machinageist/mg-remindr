@@ -2,6 +2,7 @@ use crate::{
     config::{DatabaseUrl, validate_local_database_url},
     domain::{DomainError, Lifecycle, Project, ProjectId, Tag, TagId, Todo, TodoId, Version},
     recurrence::{Frequency, RecurrenceError, Rule},
+    reminder::{Channel, DeliveryRecord, Reminder, ReminderError},
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
@@ -206,6 +207,8 @@ pub enum StorageError {
     InvalidStoredTodoData,
     #[error(transparent)]
     Recurrence(#[from] RecurrenceError),
+    #[error(transparent)]
+    Reminder(#[from] ReminderError),
     #[error(transparent)]
     Domain(#[from] DomainError),
 }
@@ -1788,6 +1791,98 @@ fn project_from_row(row: &Row) -> Result<Project, StorageError> {
 
 /// Read the complete currently representable authority in one transaction.
 ///
+/// Persist a validated reminder and verify the database returned its identity.
+pub async fn create_reminder(
+    database_url: &DatabaseUrl,
+    reminder: &Reminder,
+) -> Result<(), StorageError> {
+    reminder.validate()?;
+    validate_timestamp_precision(reminder.remind_at, "remind_at")?;
+    validate_timestamp_precision(reminder.created_at, "created_at")?;
+    validate_timestamp_precision(reminder.updated_at, "updated_at")?;
+    let (client, schema) = connect_authority(database_url, "reminder create").await?;
+    let table = schema.table("todo_reminders");
+    let channel = match reminder.channel {
+        Channel::Tui => "TUI",
+        Channel::Desktop => "DESKTOP",
+        Channel::Webhook => "WEBHOOK",
+    };
+    let lifecycle = match reminder.lifecycle {
+        crate::reminder::ReminderLifecycle::Active => "active",
+        crate::reminder::ReminderLifecycle::Paused => "paused",
+        crate::reminder::ReminderLifecycle::Cancelled => "cancelled",
+    };
+    let row = client
+        .query_one(
+            &format!(
+                "INSERT INTO {table} (id, todo_id, remind_at, channel, lifecycle, version, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id"
+            ),
+            &[
+                &reminder.id.as_uuid(),
+                &reminder.todo_id.as_uuid(),
+                &reminder.remind_at,
+                &channel,
+                &lifecycle,
+                &(reminder.version as i64),
+                &reminder.created_at,
+                &reminder.updated_at,
+            ],
+        )
+        .await
+        .map_err(|_| StorageError::Database { operation: "reminder create" })?;
+    if row.get::<_, uuid::Uuid>(0) != reminder.id.as_uuid() {
+        return Err(StorageError::Database {
+            operation: "reminder create",
+        });
+    }
+    Ok(())
+}
+
+/// Persist a pending, sent, or failed delivery record and verify its identity.
+pub async fn create_delivery_record(
+    database_url: &DatabaseUrl,
+    record: &DeliveryRecord,
+) -> Result<(), StorageError> {
+    record.validate()?;
+    validate_timestamp_precision(record.created_at, "created_at")?;
+    if let Some(attempted_at) = record.attempted_at {
+        validate_timestamp_precision(attempted_at, "attempted_at")?;
+    }
+    let (client, schema) = connect_authority(database_url, "delivery create").await?;
+    let table = schema.table("todo_reminder_deliveries");
+    let status = match record.status {
+        crate::reminder::DeliveryStatus::Pending => "pending",
+        crate::reminder::DeliveryStatus::Sent => "sent",
+        crate::reminder::DeliveryStatus::Failed => "failed",
+    };
+    let row = client
+        .query_one(
+            &format!(
+                "INSERT INTO {table} (id, reminder_id, idempotency_key, status, attempted_at, provider_reference, failure_code, created_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id"
+            ),
+            &[
+                &record.id.as_uuid(),
+                &record.reminder_id.as_uuid(),
+                &record.idempotency_key,
+                &status,
+                &record.attempted_at,
+                &record.provider_reference,
+                &record.failure_code,
+                &record.created_at,
+            ],
+        )
+        .await
+        .map_err(|_| StorageError::Database { operation: "delivery create" })?;
+    if row.get::<_, uuid::Uuid>(0) != record.id.as_uuid() {
+        return Err(StorageError::Database {
+            operation: "delivery create",
+        });
+    }
+    Ok(())
+}
+
 /// Replace the bounded recurrence rule for one authoritative todo atomically.
 pub async fn set_todo_recurrence(
     database_url: &DatabaseUrl,
