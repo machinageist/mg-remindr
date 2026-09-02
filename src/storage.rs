@@ -1,8 +1,9 @@
 use crate::{
     config::{DatabaseUrl, validate_local_database_url},
     domain::{DomainError, Lifecycle, Project, ProjectId, Tag, TagId, Todo, TodoId, Version},
+    recurrence::{Frequency, RecurrenceError, Rule},
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -16,6 +17,8 @@ pub const AUTHORITY_REVISION_MIGRATION: &str =
     include_str!("../migrations/0005_authority_revision.sql");
 pub const TODO_RELATIONSHIP_MIGRATION: &str =
     include_str!("../migrations/0006_todo_relationship_authority.sql");
+pub const TODO_RECURRENCE_MIGRATION: &str =
+    include_str!("../migrations/0007_todo_recurrence_authority.sql");
 const LEDGER: &str = "mg_todo_schema_migrations";
 const MIGRATION_LOCK: i64 = 73_407_463_646;
 
@@ -70,6 +73,13 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: TODO_RELATIONSHIP_MIGRATION,
         checksum: "9eca75aa95299df898d1bc7e1a0d27fa54de43b04d94e8e7ed0eda0809ecf36d",
         table: "todo_parents",
+    },
+    Migration {
+        version: 7,
+        name: "todo_recurrence_authority",
+        sql: TODO_RECURRENCE_MIGRATION,
+        checksum: "391adbe0240486d80938eb2651d15dd43736d3e9249608a32701ea82e8d20781",
+        table: "todo_recurrence",
     },
 ];
 
@@ -176,6 +186,8 @@ pub enum StorageError {
     UnrepresentableAuthority { kind: &'static str },
     #[error("invalid stored todo data")]
     InvalidStoredTodoData,
+    #[error(transparent)]
+    Recurrence(#[from] RecurrenceError),
     #[error(transparent)]
     Domain(#[from] DomainError),
 }
@@ -601,6 +613,14 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             ("child_id", "uuid", "NO", None),
             ("parent_id", "uuid", "NO", None),
         ],
+        7 => vec![
+            ("todo_id", "uuid", "NO", None),
+            ("start_date", "date", "NO", None),
+            ("frequency", "text", "NO", None),
+            ("interval", "int8", "NO", None),
+            ("occurrence_count", "int8", "YES", None),
+            ("until_date", "date", "YES", None),
+        ],
         _ => unreachable!("known migrations only"),
     };
     if actual
@@ -683,6 +703,15 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             "FOREIGN KEY (child_id) REFERENCES todos(id) ON DELETE CASCADE",
             "FOREIGN KEY (parent_id) REFERENCES todos(id) ON DELETE RESTRICT",
             "CHECK (child_id <> parent_id)",
+        ],
+        7 => vec![
+            "PRIMARY KEY (todo_id)",
+            "FOREIGN KEY (todo_id) REFERENCES todos(id) ON DELETE CASCADE",
+            "CHECK (frequency = ANY (ARRAY['DAILY'::text, 'WEEKLY'::text, 'MONTHLY'::text]))",
+            "CHECK (interval >= 1 AND interval <= 366)",
+            "CHECK (occurrence_count >= 1 AND occurrence_count <= 1000 OR occurrence_count IS NULL)",
+            "CHECK (occurrence_count IS NOT NULL OR until_date IS NOT NULL)",
+            "CHECK (until_date IS NULL OR until_date > start_date)",
         ],
         _ => unreachable!("known migrations only"),
     };
@@ -1701,6 +1730,108 @@ fn project_from_row(row: &Row) -> Result<Project, StorageError> {
 
 /// Read the complete currently representable authority in one transaction.
 ///
+/// Replace the bounded recurrence rule for one authoritative todo atomically.
+pub async fn set_todo_recurrence(
+    database_url: &DatabaseUrl,
+    todo_id: TodoId,
+    start: NaiveDate,
+    rule: &Rule,
+) -> Result<(), StorageError> {
+    rule.validate(start)?;
+    let (mut client, schema) = connect_authority(database_url, "recurrence set").await?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|_| StorageError::Database {
+            operation: "recurrence set",
+        })?;
+    let todos = schema.table("todos");
+    let exists = transaction
+        .query_opt(
+            &format!("SELECT 1 FROM {todos} WHERE id = $1"),
+            &[&todo_id.as_uuid()],
+        )
+        .await
+        .map_err(|_| StorageError::Database {
+            operation: "recurrence set",
+        })?
+        .is_some();
+    if !exists {
+        return Err(StorageError::InvalidStoredTodoData);
+    }
+    let recurrence = schema.table("todo_recurrence");
+    let frequency = match rule.frequency {
+        Frequency::Daily => "DAILY",
+        Frequency::Weekly => "WEEKLY",
+        Frequency::Monthly => "MONTHLY",
+    };
+    transaction
+        .execute(
+            &format!(
+                "INSERT INTO {recurrence} (todo_id, start_date, frequency, interval, occurrence_count, until_date) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (todo_id) DO UPDATE SET start_date = EXCLUDED.start_date, frequency = EXCLUDED.frequency, \
+                 interval = EXCLUDED.interval, occurrence_count = EXCLUDED.occurrence_count, until_date = EXCLUDED.until_date"
+            ),
+            &[&todo_id.as_uuid(), &start, &frequency, &i64::from(rule.interval), &rule.count.map(i64::from), &rule.until],
+        )
+        .await
+        .map_err(|_| StorageError::Database { operation: "recurrence set" })?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| StorageError::Database {
+            operation: "recurrence set",
+        })?;
+    Ok(())
+}
+
+/// Read the authoritative recurrence rule for one todo.
+pub async fn find_todo_recurrence(
+    database_url: &DatabaseUrl,
+    todo_id: TodoId,
+) -> Result<Option<(NaiveDate, Rule)>, StorageError> {
+    let (client, schema) = connect_authority(database_url, "recurrence find").await?;
+    let recurrence = schema.table("todo_recurrence");
+    let row = client
+        .query_opt(
+            &format!("SELECT start_date, frequency, interval, occurrence_count, until_date FROM {recurrence} WHERE todo_id = $1"),
+            &[&todo_id.as_uuid()],
+        )
+        .await
+        .map_err(|_| StorageError::Database { operation: "recurrence find" })?;
+    let Some(row) = row else { return Ok(None) };
+    let start: NaiveDate = row
+        .try_get(0)
+        .map_err(|_| StorageError::InvalidStoredTodoData)?;
+    let frequency = match row
+        .try_get::<_, String>(1)
+        .map_err(|_| StorageError::InvalidStoredTodoData)?
+        .as_str()
+    {
+        "DAILY" => Frequency::Daily,
+        "WEEKLY" => Frequency::Weekly,
+        "MONTHLY" => Frequency::Monthly,
+        _ => return Err(StorageError::InvalidStoredTodoData),
+    };
+    let interval = u32::try_from(
+        row.try_get::<_, i64>(2)
+            .map_err(|_| StorageError::InvalidStoredTodoData)?,
+    )
+    .map_err(|_| StorageError::InvalidStoredTodoData)?;
+    let count = row
+        .try_get::<_, Option<i64>>(3)
+        .map_err(|_| StorageError::InvalidStoredTodoData)?
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| StorageError::InvalidStoredTodoData)?;
+    let until = row
+        .try_get(4)
+        .map_err(|_| StorageError::InvalidStoredTodoData)?;
+    let rule = Rule::new(frequency, interval, count, until, start)?;
+    Ok(Some((start, rule)))
+}
+
 /// Relationship, recurrence, and reminder rows are not fabricated here; each
 /// must be added to the export contract with its own migration and tests.
 pub async fn export_authority(database_url: &DatabaseUrl) -> Result<AuthorityExport, StorageError> {

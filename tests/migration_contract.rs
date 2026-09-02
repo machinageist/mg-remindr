@@ -1,6 +1,6 @@
 use mg_todo::storage::{
     AUTHORITY_REVISION_MIGRATION, FOUNDATION_MIGRATION, MIGRATIONS, TAG_MIGRATION, TODO_MIGRATION,
-    TODO_RELATIONSHIP_MIGRATION, TODO_TAG_MIGRATION,
+    TODO_RECURRENCE_MIGRATION, TODO_RELATIONSHIP_MIGRATION, TODO_TAG_MIGRATION,
 };
 use sha2::{Digest, Sha256};
 
@@ -10,7 +10,7 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[test]
 fn foundation_migrations_are_embedded_and_append_only() {
-    assert_eq!(MIGRATIONS.len(), 6);
+    assert_eq!(MIGRATIONS.len(), 7);
     assert_eq!(MIGRATIONS[0].version, 1);
     assert_eq!(MIGRATIONS[0].name, "project_authority");
     assert_eq!(MIGRATIONS[0].sql, FOUNDATION_MIGRATION);
@@ -85,6 +85,14 @@ fn foundation_migrations_are_embedded_and_append_only() {
     assert!(TODO_RELATIONSHIP_MIGRATION.contains("CREATE TABLE todo_dependencies"));
     assert!(TODO_RELATIONSHIP_MIGRATION.contains("CHECK (child_id <> parent_id)"));
     assert!(!TODO_RELATIONSHIP_MIGRATION.contains("DROP "));
+
+    assert_eq!(MIGRATIONS[6].version, 7);
+    assert_eq!(MIGRATIONS[6].name, "todo_recurrence_authority");
+    assert_eq!(MIGRATIONS[6].sql, TODO_RECURRENCE_MIGRATION);
+    assert!(TODO_RECURRENCE_MIGRATION.contains("CREATE TABLE todo_recurrence"));
+    assert!(TODO_RECURRENCE_MIGRATION.contains("occurrence_count"));
+    assert!(TODO_RECURRENCE_MIGRATION.contains("until_date"));
+    assert!(!TODO_RECURRENCE_MIGRATION.contains("DROP "));
 }
 
 #[test]
