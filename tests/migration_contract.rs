@@ -1,4 +1,7 @@
-use mg_todo::storage::{FOUNDATION_MIGRATION, MIGRATIONS, TAG_MIGRATION, TODO_MIGRATION};
+use mg_todo::storage::{
+    AUTHORITY_REVISION_MIGRATION, FOUNDATION_MIGRATION, MIGRATIONS, TAG_MIGRATION, TODO_MIGRATION,
+    TODO_TAG_MIGRATION,
+};
 use sha2::{Digest, Sha256};
 
 const IMMUTABLE_V1_SHA256: &str =
@@ -7,7 +10,7 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[test]
 fn foundation_migrations_are_embedded_and_append_only() {
-    assert_eq!(MIGRATIONS.len(), 3);
+    assert_eq!(MIGRATIONS.len(), 5);
     assert_eq!(MIGRATIONS[0].version, 1);
     assert_eq!(MIGRATIONS[0].name, "project_authority");
     assert_eq!(MIGRATIONS[0].sql, FOUNDATION_MIGRATION);
@@ -53,6 +56,27 @@ fn foundation_migrations_are_embedded_and_append_only() {
     assert!(!TODO_MIGRATION.contains("recurrence_rule"));
     assert!(!TODO_MIGRATION.contains("IF NOT EXISTS"));
     assert!(!TODO_MIGRATION.contains("DROP "));
+
+    assert_eq!(MIGRATIONS[3].version, 4);
+    assert_eq!(MIGRATIONS[3].name, "todo_tag_authority");
+    assert_eq!(MIGRATIONS[3].sql, TODO_TAG_MIGRATION);
+    assert!(TODO_TAG_MIGRATION.contains("CREATE TABLE todo_tags"));
+    assert!(TODO_TAG_MIGRATION.contains("PRIMARY KEY (todo_id, tag_id)"));
+    assert!(TODO_TAG_MIGRATION.contains("ON DELETE CASCADE"));
+    assert!(TODO_TAG_MIGRATION.contains("ON DELETE RESTRICT"));
+    assert!(!TODO_TAG_MIGRATION.contains("DROP "));
+
+    assert_eq!(MIGRATIONS[4].version, 5);
+    assert_eq!(MIGRATIONS[4].name, "authority_revision");
+    assert_eq!(MIGRATIONS[4].sql, AUTHORITY_REVISION_MIGRATION);
+    assert!(AUTHORITY_REVISION_MIGRATION.contains("CREATE TABLE mg_todo_authority_state"));
+    assert!(
+        AUTHORITY_REVISION_MIGRATION.contains("CREATE FUNCTION mg_todo_bump_authority_revision")
+    );
+    assert!(AUTHORITY_REVISION_MIGRATION.contains("CREATE TRIGGER mg_todo_projects_revision"));
+    assert!(AUTHORITY_REVISION_MIGRATION.contains("CREATE TRIGGER mg_todo_tags_revision"));
+    assert!(AUTHORITY_REVISION_MIGRATION.contains("CREATE TRIGGER mg_todo_todos_revision"));
+    assert!(!AUTHORITY_REVISION_MIGRATION.contains("DROP "));
 }
 
 #[test]

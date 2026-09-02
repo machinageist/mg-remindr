@@ -11,6 +11,9 @@ use tokio_postgres::{Client, GenericClient, NoTls, Row, error::SqlState};
 pub const FOUNDATION_MIGRATION: &str = include_str!("../migrations/0001_project_authority.sql");
 pub const TAG_MIGRATION: &str = include_str!("../migrations/0002_tag_authority.sql");
 pub const TODO_MIGRATION: &str = include_str!("../migrations/0003_todo_authority.sql");
+pub const TODO_TAG_MIGRATION: &str = include_str!("../migrations/0004_todo_tag_authority.sql");
+pub const AUTHORITY_REVISION_MIGRATION: &str =
+    include_str!("../migrations/0005_authority_revision.sql");
 const LEDGER: &str = "mg_todo_schema_migrations";
 const MIGRATION_LOCK: i64 = 73_407_463_646;
 
@@ -44,6 +47,20 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: TODO_MIGRATION,
         checksum: "0f9e31afdb4b2ae562fb065a48b683e0c554cf124ea4e97296ab6630f20af6f2",
         table: "todos",
+    },
+    Migration {
+        version: 4,
+        name: "todo_tag_authority",
+        sql: TODO_TAG_MIGRATION,
+        checksum: "fffb6336ac6d6c02a39dfcf96333858eab15d947594ac50104dfdae57e358716",
+        table: "todo_tags",
+    },
+    Migration {
+        version: 5,
+        name: "authority_revision",
+        sql: AUTHORITY_REVISION_MIGRATION,
+        checksum: "680eaac3aac4b42fe2db5e0e681df0a1b4eb4d5170d7751b1a4f0b84e6f9239d",
+        table: "mg_todo_authority_state",
     },
 ];
 
@@ -135,6 +152,8 @@ pub enum StorageError {
     InvalidTodoReplacement { reason: &'static str },
     #[error("todo project {project_id} was not found")]
     TodoProjectNotFound { project_id: ProjectId },
+    #[error("todo tag {tag_id} was not found")]
+    TodoTagNotFound { tag_id: TagId },
     #[error("invalid stored todo data")]
     InvalidStoredTodoData,
     #[error(transparent)]
