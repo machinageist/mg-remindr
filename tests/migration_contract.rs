@@ -9,6 +9,18 @@ const IMMUTABLE_V1_SHA256: &str =
     "0c821017adbb6c219ad371a7729b7d898a178bd9102279d71524504710ed78c0";
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
+fn sha256_hex(sql: &str) -> String {
+    Sha256::digest(sql.as_bytes())
+        .iter()
+        .flat_map(|byte| {
+            [
+                char::from(HEX[usize::from(byte >> 4)]),
+                char::from(HEX[usize::from(byte & 0x0f)]),
+            ]
+        })
+        .collect()
+}
+
 #[test]
 fn foundation_migrations_are_embedded_and_append_only() {
     assert_eq!(MIGRATIONS.len(), 9);
@@ -99,12 +111,17 @@ fn foundation_migrations_are_embedded_and_append_only() {
     assert_eq!(MIGRATIONS[7].name, "todo_reminder_authority");
     assert_eq!(MIGRATIONS[7].sql, TODO_REMINDER_MIGRATION);
     assert!(TODO_REMINDER_MIGRATION.contains("CREATE TABLE todo_reminders"));
+    assert_eq!(sha256_hex(TODO_REMINDER_MIGRATION), MIGRATIONS[7].checksum);
     assert!(!TODO_REMINDER_MIGRATION.contains("DROP "));
     assert_eq!(MIGRATIONS[8].version, 9);
     assert_eq!(MIGRATIONS[8].name, "todo_reminder_delivery_authority");
     assert_eq!(MIGRATIONS[8].sql, TODO_REMINDER_DELIVERY_MIGRATION);
     assert!(TODO_REMINDER_DELIVERY_MIGRATION.contains("CREATE TABLE todo_reminder_deliveries"));
     assert!(TODO_REMINDER_DELIVERY_MIGRATION.contains("idempotency_key text NOT NULL UNIQUE"));
+    assert_eq!(
+        sha256_hex(TODO_REMINDER_DELIVERY_MIGRATION),
+        MIGRATIONS[8].checksum
+    );
     assert!(!TODO_REMINDER_DELIVERY_MIGRATION.contains("DROP "));
 }
 
