@@ -568,6 +568,15 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             ("created_at", "timestamptz", "NO", None),
             ("updated_at", "timestamptz", "NO", None),
         ],
+        4 => vec![
+            ("todo_id", "uuid", "NO", None),
+            ("tag_id", "uuid", "NO", None),
+        ],
+        5 => vec![
+            ("singleton", "bool", "NO", Some("true")),
+            ("revision", "int8", "NO", None),
+            ("changed_at", "timestamptz", "NO", None),
+        ],
         _ => unreachable!("known migrations only"),
     };
     if actual
@@ -578,7 +587,7 @@ async fn verify_table_schema<C: GenericClient + Sync>(
                     name.to_owned(),
                     kind.to_owned(),
                     nullable.to_owned(),
-                    default,
+                    default.map(str::to_owned),
                 )
             })
             .collect::<Vec<_>>()
@@ -634,6 +643,16 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             "CHECK (lifecycle = ANY (ARRAY['open'::text, 'completed'::text, 'trashed'::text]))",
             "CHECK (version >= 1)",
             "CHECK (updated_at >= created_at)",
+        ],
+        4 => vec![
+            "PRIMARY KEY (todo_id, tag_id)",
+            "FOREIGN KEY (todo_id) REFERENCES todos(id) ON DELETE CASCADE",
+            "FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE RESTRICT",
+        ],
+        5 => vec![
+            "PRIMARY KEY (singleton)",
+            "CHECK (singleton)",
+            "CHECK (revision >= 1)",
         ],
         _ => unreachable!("known migrations only"),
     };
