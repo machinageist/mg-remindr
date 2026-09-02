@@ -80,13 +80,16 @@ impl Rule {
         let mut current = start;
         for occurrence in 0..=100_000_u32 {
             if current > through || self.until.is_some_and(|until| current > until) {
-                break;
+                return Ok(result);
             }
             if current >= from {
                 result.push(current);
             }
             if self.count.is_some_and(|count| occurrence + 1 >= count) {
-                break;
+                return Ok(result);
+            }
+            if current >= through || self.until.is_some_and(|until| current >= until) {
+                return Ok(result);
             }
             current = match self.frequency {
                 Frequency::Daily => {
@@ -99,13 +102,7 @@ impl Rule {
             }
             .ok_or(RecurrenceError::ExpansionOverflow)?;
         }
-        if self.count.is_none()
-            && self.until.is_some_and(|until| current <= until)
-            && current <= through
-        {
-            return Err(RecurrenceError::ExpansionOverflow);
-        }
-        Ok(result)
+        Err(RecurrenceError::ExpansionOverflow)
     }
 }
 
@@ -143,5 +140,15 @@ mod tests {
         let dates = rule.expand(start, start, until).unwrap();
         assert_eq!(dates.len(), 1462);
         assert_eq!(dates.last(), Some(&until));
+    }
+
+    #[test]
+    fn maximum_until_date_is_emitted_without_post_bound_overflow() {
+        let start = NaiveDate::MAX.pred_opt().unwrap();
+        let rule = Rule::new(Frequency::Daily, 1, None, Some(NaiveDate::MAX), start).unwrap();
+        assert_eq!(
+            rule.expand(start, start, NaiveDate::MAX).unwrap(),
+            vec![start, NaiveDate::MAX]
+        );
     }
 }
