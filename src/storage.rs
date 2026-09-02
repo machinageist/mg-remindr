@@ -19,6 +19,10 @@ pub const TODO_RELATIONSHIP_MIGRATION: &str =
     include_str!("../migrations/0006_todo_relationship_authority.sql");
 pub const TODO_RECURRENCE_MIGRATION: &str =
     include_str!("../migrations/0007_todo_recurrence_authority.sql");
+pub const TODO_REMINDER_DELIVERY_MIGRATION: &str =
+    include_str!("../migrations/0009_todo_reminder_delivery_authority.sql");
+pub const TODO_REMINDER_MIGRATION: &str =
+    include_str!("../migrations/0008_todo_reminder_authority.sql");
 const LEDGER: &str = "mg_todo_schema_migrations";
 const MIGRATION_LOCK: i64 = 73_407_463_646;
 
@@ -80,6 +84,20 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: TODO_RECURRENCE_MIGRATION,
         checksum: "391adbe0240486d80938eb2651d15dd43736d3e9249608a32701ea82e8d20781",
         table: "todo_recurrence",
+    },
+    Migration {
+        version: 8,
+        name: "todo_reminder_authority",
+        sql: TODO_REMINDER_MIGRATION,
+        checksum: "ae7dcac9333555742d19bb5bdc6dc92810769ef394215181c5577655c5f40b38",
+        table: "todo_reminders",
+    },
+    Migration {
+        version: 9,
+        name: "todo_reminder_delivery_authority",
+        sql: TODO_REMINDER_DELIVERY_MIGRATION,
+        checksum: "8ce0adab4da891d8e0f152f9907b9db680f32a1b1ae604b57dde173baf31a67f",
+        table: "todo_reminder_deliveries",
     },
 ];
 
@@ -621,6 +639,26 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             ("occurrence_count", "int8", "YES", None),
             ("until_date", "date", "YES", None),
         ],
+        8 => vec![
+            ("id", "uuid", "NO", None),
+            ("todo_id", "uuid", "NO", None),
+            ("remind_at", "timestamptz", "NO", None),
+            ("channel", "text", "NO", None),
+            ("lifecycle", "text", "NO", None),
+            ("version", "int8", "NO", None),
+            ("created_at", "timestamptz", "NO", None),
+            ("updated_at", "timestamptz", "NO", None),
+        ],
+        9 => vec![
+            ("id", "uuid", "NO", None),
+            ("reminder_id", "uuid", "NO", None),
+            ("idempotency_key", "text", "NO", None),
+            ("status", "text", "NO", None),
+            ("attempted_at", "timestamptz", "YES", None),
+            ("provider_reference", "text", "YES", None),
+            ("failure_code", "text", "YES", None),
+            ("created_at", "timestamptz", "NO", None),
+        ],
         _ => unreachable!("known migrations only"),
     };
     if actual
@@ -648,7 +686,7 @@ async fn verify_table_schema<C: GenericClient + Sync>(
              FROM pg_catalog.pg_constraint c \
              JOIN pg_catalog.pg_class t ON t.oid = c.conrelid \
              JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
-             WHERE n.nspname = $1 AND t.relname = $2 AND c.contype IN ('p', 'c', 'f') \
+             WHERE n.nspname = $1 AND t.relname = $2 AND c.contype IN ('p', 'c', 'f', 'u') \\
              ORDER BY c.contype, c.conname",
             &[&schema.name, &migration.table],
         )
@@ -712,6 +750,26 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             "CHECK (occurrence_count >= 1 AND occurrence_count <= 1000 OR occurrence_count IS NULL)",
             "CHECK (occurrence_count IS NOT NULL OR until_date IS NOT NULL)",
             "CHECK (until_date IS NULL OR until_date > start_date)",
+        ],
+        8 => vec![
+            "PRIMARY KEY (id)",
+            "FOREIGN KEY (todo_id) REFERENCES todos(id) ON DELETE CASCADE",
+            "CHECK (channel = ANY (ARRAY['TUI'::text, 'DESKTOP'::text, 'WEBHOOK'::text]))",
+            "CHECK (lifecycle = ANY (ARRAY['active'::text, 'paused'::text, 'cancelled'::text]))",
+            "CHECK (version >= 1)",
+            "CHECK (updated_at >= created_at)",
+        ],
+        9 => vec![
+            "PRIMARY KEY (id)",
+            "FOREIGN KEY (reminder_id) REFERENCES todo_reminders(id) ON DELETE CASCADE",
+            "UNIQUE (idempotency_key)",
+            "CHECK (btrim(idempotency_key) <> ''::text)",
+            "CHECK (attempted_at IS NULL OR attempted_at >= created_at)",
+            "CHECK (status = ANY (ARRAY['pending'::text, 'sent'::text, 'failed'::text]))",
+            "CHECK (status <> 'sent'::text OR provider_reference IS NOT NULL)",
+            "CHECK (status <> 'failed'::text OR failure_code IS NOT NULL)",
+            "CHECK (status = 'pending'::text OR attempted_at IS NOT NULL)",
+            "CHECK (status <> 'pending'::text OR attempted_at IS NULL)",
         ],
         _ => unreachable!("known migrations only"),
     };

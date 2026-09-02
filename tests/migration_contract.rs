@@ -1,6 +1,7 @@
 use mg_todo::storage::{
     AUTHORITY_REVISION_MIGRATION, FOUNDATION_MIGRATION, MIGRATIONS, TAG_MIGRATION, TODO_MIGRATION,
-    TODO_RECURRENCE_MIGRATION, TODO_RELATIONSHIP_MIGRATION, TODO_TAG_MIGRATION,
+    TODO_RECURRENCE_MIGRATION, TODO_RELATIONSHIP_MIGRATION, TODO_REMINDER_DELIVERY_MIGRATION,
+    TODO_REMINDER_MIGRATION, TODO_TAG_MIGRATION,
 };
 use sha2::{Digest, Sha256};
 
@@ -10,7 +11,7 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[test]
 fn foundation_migrations_are_embedded_and_append_only() {
-    assert_eq!(MIGRATIONS.len(), 7);
+    assert_eq!(MIGRATIONS.len(), 9);
     assert_eq!(MIGRATIONS[0].version, 1);
     assert_eq!(MIGRATIONS[0].name, "project_authority");
     assert_eq!(MIGRATIONS[0].sql, FOUNDATION_MIGRATION);
@@ -93,6 +94,18 @@ fn foundation_migrations_are_embedded_and_append_only() {
     assert!(TODO_RECURRENCE_MIGRATION.contains("occurrence_count"));
     assert!(TODO_RECURRENCE_MIGRATION.contains("until_date"));
     assert!(!TODO_RECURRENCE_MIGRATION.contains("DROP "));
+
+    assert_eq!(MIGRATIONS[7].version, 8);
+    assert_eq!(MIGRATIONS[7].name, "todo_reminder_authority");
+    assert_eq!(MIGRATIONS[7].sql, TODO_REMINDER_MIGRATION);
+    assert!(TODO_REMINDER_MIGRATION.contains("CREATE TABLE todo_reminders"));
+    assert!(!TODO_REMINDER_MIGRATION.contains("DROP "));
+    assert_eq!(MIGRATIONS[8].version, 9);
+    assert_eq!(MIGRATIONS[8].name, "todo_reminder_delivery_authority");
+    assert_eq!(MIGRATIONS[8].sql, TODO_REMINDER_DELIVERY_MIGRATION);
+    assert!(TODO_REMINDER_DELIVERY_MIGRATION.contains("CREATE TABLE todo_reminder_deliveries"));
+    assert!(TODO_REMINDER_DELIVERY_MIGRATION.contains("idempotency_key text NOT NULL UNIQUE"));
+    assert!(!TODO_REMINDER_DELIVERY_MIGRATION.contains("DROP "));
 }
 
 #[test]
