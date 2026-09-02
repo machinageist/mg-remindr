@@ -138,11 +138,7 @@ pub async fn export(database_url: &DatabaseUrl) -> Result<Snapshot, StorageError
         });
     }
     for todo in todos {
-        if !matches!(todo.lifecycle(), crate::domain::Lifecycle::Open) {
-            return Err(StorageError::UnrepresentableAuthority {
-                kind: "todo lifecycle",
-            });
-        }
+        validate_exportable_todo(&todo)?;
         let id = todo.id().to_string();
         let todo_global = format!("{APP}:todo:{id}");
         if let Some(project_id) = todo.project_id() {
@@ -255,6 +251,15 @@ fn todo_payload(todo: &crate::domain::Todo) -> serde_json::Value {
     })
 }
 
+fn validate_exportable_todo(todo: &crate::domain::Todo) -> Result<(), StorageError> {
+    if !matches!(todo.lifecycle(), crate::domain::Lifecycle::Open) {
+        return Err(StorageError::UnrepresentableAuthority {
+            kind: "todo lifecycle",
+        });
+    }
+    Ok(())
+}
+
 fn lifecycle(value: crate::domain::Lifecycle, trashed_at: Option<DateTime<Utc>>) -> Lifecycle {
     let (state, trashed_at) = match value {
         crate::domain::Lifecycle::Open | crate::domain::Lifecycle::Completed => ("active", None),
@@ -292,6 +297,30 @@ mod tests {
     use super::*;
     use crate::domain::{Lifecycle as TodoLifecycle, Todo, TodoId, Version};
     use chrono::TimeZone;
+
+    #[test]
+    fn non_open_todos_are_rejected_instead_of_downgraded() {
+        let timestamp = Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap();
+        let todo = Todo::new(
+            TodoId::new(),
+            "completed work".to_owned(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            TodoLifecycle::Completed,
+            Version::new(),
+            timestamp,
+            timestamp,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_exportable_todo(&todo),
+            Err(StorageError::UnrepresentableAuthority {
+                kind: "todo lifecycle"
+            })
+        );
+    }
 
     #[test]
     fn todo_payload_is_the_lossless_calr_mvp_shape() {
