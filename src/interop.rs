@@ -286,3 +286,57 @@ fn digest(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Lifecycle as TodoLifecycle, Todo, TodoId, Version};
+    use chrono::TimeZone;
+
+    #[test]
+    fn todo_payload_is_the_lossless_calr_mvp_shape() {
+        let timestamp = Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap();
+        let todo = Todo::new(
+            TodoId::new(),
+            "ship snapshot".to_owned(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            TodoLifecycle::Open,
+            Version::new(),
+            timestamp,
+            timestamp,
+        )
+        .unwrap();
+        let payload = todo_payload(&todo);
+        let object = payload.as_object().unwrap();
+        let expected = [
+            "id",
+            "title",
+            "due",
+            "recurrence",
+            "reminders",
+            "priority",
+            "project_id",
+            "tag_ids",
+            "dependency_ids",
+            "notes",
+            "parent_id",
+            "completed_at",
+            "trashed_at",
+            "version",
+            "created_at",
+            "updated_at",
+        ];
+        assert_eq!(object.len(), expected.len());
+        for key in expected {
+            assert!(object.contains_key(key), "missing payload key: {key}");
+        }
+        assert!(object["due"].is_null());
+        assert!(object["recurrence"].is_null());
+        assert_eq!(object["reminders"], serde_json::json!([]));
+        assert_eq!(object["priority"], "none");
+        assert_eq!(object["version"], 1);
+    }
+}
