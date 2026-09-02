@@ -138,6 +138,11 @@ pub async fn export(database_url: &DatabaseUrl) -> Result<Snapshot, StorageError
         });
     }
     for todo in todos {
+        if !matches!(todo.lifecycle(), crate::domain::Lifecycle::Open) {
+            return Err(StorageError::UnrepresentableAuthority {
+                kind: "todo lifecycle",
+            });
+        }
         let id = todo.id().to_string();
         let todo_global = format!("{APP}:todo:{id}");
         if let Some(project_id) = todo.project_id() {
@@ -183,9 +188,7 @@ pub async fn export(database_url: &DatabaseUrl) -> Result<Snapshot, StorageError
             })?,
             observed_at: todo.updated_at(),
             lifecycle: lifecycle(todo.lifecycle(), None),
-            payload: serde_json::to_value(todo).map_err(|_| StorageError::Database {
-                operation: "interop export",
-            })?,
+            payload: todo_payload(&todo),
         });
     }
     records.sort_by(|a, b| a.global_id.cmp(&b.global_id));
@@ -228,6 +231,27 @@ pub async fn export(database_url: &DatabaseUrl) -> Result<Snapshot, StorageError
             code: "purged_absence".into(),
             message: "Purged rows are absent from the authority export.".into(),
         }],
+    })
+}
+
+fn todo_payload(todo: &crate::domain::Todo) -> serde_json::Value {
+    serde_json::json!({
+        "id": todo.id(),
+        "title": todo.title(),
+        "due": null,
+        "recurrence": null,
+        "reminders": [],
+        "priority": "none",
+        "project_id": todo.project_id(),
+        "tag_ids": todo.tag_ids(),
+        "dependency_ids": todo.dependency_ids(),
+        "notes": null,
+        "parent_id": todo.parent_id(),
+        "completed_at": null,
+        "trashed_at": null,
+        "version": todo.version().value(),
+        "created_at": todo.created_at(),
+        "updated_at": todo.updated_at()
     })
 }
 
