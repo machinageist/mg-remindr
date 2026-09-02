@@ -170,6 +170,8 @@ pub enum StorageError {
     InvalidTodoReplacement { reason: &'static str },
     #[error("todo project {project_id} was not found")]
     TodoProjectNotFound { project_id: ProjectId },
+    #[error("todo relationship conflict: {reason}")]
+    TodoRelationshipConflict { reason: &'static str },
     #[error("authoritative {kind} cannot be represented by the current interop schema")]
     UnrepresentableAuthority { kind: &'static str },
     #[error("invalid stored todo data")]
@@ -1098,8 +1100,7 @@ impl PostgresTodoRepository {
 
     pub async fn create(&self, todo: &Todo) -> Result<(), StorageError> {
         revalidate_todo(todo)?;
-        validate_todo_foundation(todo)
-            .map_err(|reason| StorageError::InvalidTodoCreation { reason })?;
+
         validate_timestamp_precision(todo.created_at(), "created_at")?;
         validate_timestamp_precision(todo.updated_at(), "updated_at")?;
         let version = todo_creation_database_version(todo.version())?;
@@ -1111,6 +1112,7 @@ impl PostgresTodoRepository {
                 operation: "todo create",
             })?;
         validate_todo_project(&transaction, &schema, todo.project_id()).await?;
+        validate_todo_relationships(&transaction, &schema, todo).await?;
         let todos = schema.table("todos");
         let lifecycle = lifecycle_text(todo.lifecycle());
         let result = transaction
@@ -1132,12 +1134,15 @@ impl PostgresTodoRepository {
             )
             .await;
         match result {
-            Ok(1) => transaction
-                .commit()
-                .await
-                .map_err(|_| StorageError::Database {
-                    operation: "todo create",
-                }),
+            Ok(1) => {
+                persist_todo_relationships(&transaction, &schema, todo).await?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|_| StorageError::Database {
+                        operation: "todo create",
+                    })
+            }
             Ok(_) => Err(StorageError::Database {
                 operation: "todo create",
             }),
@@ -1153,7 +1158,7 @@ impl PostgresTodoRepository {
     pub async fn find(&self, todo_id: TodoId) -> Result<Option<Todo>, StorageError> {
         let (client, schema) = connect_authority(&self.database_url, "todo find").await?;
         let todos = schema.table("todos");
-        client
+        let row = client
             .query_opt(
                 &format!(
                     "SELECT id, title, project_id, lifecycle, version, created_at, updated_at \
@@ -1164,10 +1169,14 @@ impl PostgresTodoRepository {
             .await
             .map_err(|_| StorageError::Database {
                 operation: "todo find",
-            })?
-            .as_ref()
-            .map(todo_from_row)
-            .transpose()
+            })?;
+        let todo = row.as_ref().map(todo_from_row).transpose()?;
+        match todo {
+            Some(todo) => load_todo_relationships(&client, &schema, todo)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
     }
 
     /// List core todos in deterministic ID order.
@@ -1186,7 +1195,12 @@ impl PostgresTodoRepository {
             .map_err(|_| StorageError::Database {
                 operation: "todo list",
             })?;
-        rows.iter().map(todo_from_row).collect()
+        let mut result = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let todo = todo_from_row(row)?;
+            result.push(load_todo_relationships(&client, &schema, todo).await?);
+        }
+        Ok(result)
     }
 
     pub async fn replace(&self, expected: Version, replacement: &Todo) -> Result<(), StorageError> {
@@ -1216,7 +1230,7 @@ impl PostgresTodoRepository {
             .ok_or(StorageError::TodoNotFound {
                 todo_id: replacement.id(),
             })?;
-        let current = todo_from_row(&row)?;
+        let current = load_todo_relationships(&transaction, &schema, todo_from_row(&row)?).await?;
         if current.version() != expected {
             return Err(StorageError::TodoVersionConflict {
                 todo_id: replacement.id(),
@@ -1243,6 +1257,7 @@ impl PostgresTodoRepository {
             });
         }
         validate_todo_project(&transaction, &schema, replacement.project_id()).await?;
+        validate_todo_relationships(&transaction, &schema, replacement).await?;
         let lifecycle = lifecycle_text(replacement.lifecycle());
         let changed = transaction
             .execute(
@@ -1269,6 +1284,7 @@ impl PostgresTodoRepository {
                 operation: "todo replace",
             });
         }
+        persist_todo_relationships(&transaction, &schema, replacement).await?;
         transaction
             .commit()
             .await
@@ -1276,6 +1292,217 @@ impl PostgresTodoRepository {
                 operation: "todo replace",
             })
     }
+}
+
+async fn validate_todo_relationships<C: GenericClient + Sync>(
+    client: &C,
+    schema: &AuthoritySchema,
+    todo: &Todo,
+) -> Result<(), StorageError> {
+    let todos = schema.table("todos");
+    let tags = schema.table("tags");
+    let parents = schema.table("todo_parents");
+    let dependencies = schema.table("todo_dependencies");
+    if let Some(parent) = todo.parent_id() {
+        if parent == todo.id() {
+            return Err(StorageError::TodoRelationshipConflict {
+                reason: "todo cannot be its own parent",
+            });
+        }
+        let exists: bool = client
+            .query_one(
+                &format!("SELECT EXISTS (SELECT 1 FROM {todos} WHERE id = $1)"),
+                &[&parent.as_uuid()],
+            )
+            .await
+            .map_err(|_| StorageError::Database {
+                operation: "todo parent validation",
+            })?
+            .get(0);
+        if !exists {
+            return Err(StorageError::TodoRelationshipConflict {
+                reason: "parent todo was not found",
+            });
+        }
+        let cycle: bool = client.query_one(&format!("WITH RECURSIVE ancestors(id) AS (SELECT $1::uuid UNION SELECT p.parent_id FROM {parents} p JOIN ancestors a ON p.child_id = a.id) SELECT EXISTS (SELECT 1 FROM ancestors WHERE id = $2)"), &[&parent.as_uuid(), &todo.id().as_uuid()]).await
+            .map_err(|_| StorageError::Database { operation: "todo parent validation" })?.get(0);
+        if cycle {
+            return Err(StorageError::TodoRelationshipConflict {
+                reason: "parent relationship would create a cycle",
+            });
+        }
+    }
+    for dependency in todo.dependency_ids() {
+        if *dependency == todo.id() {
+            return Err(StorageError::TodoRelationshipConflict {
+                reason: "todo cannot depend on itself",
+            });
+        }
+        let exists: bool = client
+            .query_one(
+                &format!("SELECT EXISTS (SELECT 1 FROM {todos} WHERE id = $1)"),
+                &[&dependency.as_uuid()],
+            )
+            .await
+            .map_err(|_| StorageError::Database {
+                operation: "todo dependency validation",
+            })?
+            .get(0);
+        if !exists {
+            return Err(StorageError::TodoRelationshipConflict {
+                reason: "dependency todo was not found",
+            });
+        }
+        let cycle: bool = client.query_one(&format!("WITH RECURSIVE reach(id) AS (SELECT $1::uuid UNION SELECT d.prerequisite_id FROM {dependencies} d JOIN reach r ON d.dependent_id = r.id) SELECT EXISTS (SELECT 1 FROM reach WHERE id = $2)"), &[&dependency.as_uuid(), &todo.id().as_uuid()]).await
+            .map_err(|_| StorageError::Database { operation: "todo dependency validation" })?.get(0);
+        if cycle {
+            return Err(StorageError::TodoRelationshipConflict {
+                reason: "dependency relationship would create a cycle",
+            });
+        }
+    }
+    for tag in todo.tag_ids() {
+        let exists: bool = client
+            .query_one(
+                &format!("SELECT EXISTS (SELECT 1 FROM {tags} WHERE id = $1)"),
+                &[&tag.as_uuid()],
+            )
+            .await
+            .map_err(|_| StorageError::Database {
+                operation: "todo tag validation",
+            })?
+            .get(0);
+        if !exists {
+            return Err(StorageError::TodoRelationshipConflict {
+                reason: "tag was not found",
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn persist_todo_relationships<C: GenericClient + Sync>(
+    client: &C,
+    schema: &AuthoritySchema,
+    todo: &Todo,
+) -> Result<(), StorageError> {
+    let todo_id = todo.id().as_uuid();
+    let parents = schema.table("todo_parents");
+    let dependencies = schema.table("todo_dependencies");
+    let tags = schema.table("todo_tags");
+    client
+        .execute(
+            &format!("DELETE FROM {parents} WHERE child_id = $1"),
+            &[&todo_id],
+        )
+        .await
+        .map_err(|_| StorageError::Database {
+            operation: "todo relationship write",
+        })?;
+    client
+        .execute(
+            &format!("DELETE FROM {dependencies} WHERE dependent_id = $1"),
+            &[&todo_id],
+        )
+        .await
+        .map_err(|_| StorageError::Database {
+            operation: "todo relationship write",
+        })?;
+    client
+        .execute(
+            &format!("DELETE FROM {tags} WHERE todo_id = $1"),
+            &[&todo_id],
+        )
+        .await
+        .map_err(|_| StorageError::Database {
+            operation: "todo relationship write",
+        })?;
+    if let Some(parent) = todo.parent_id() {
+        client
+            .execute(
+                &format!("INSERT INTO {parents} (child_id, parent_id) VALUES ($1, $2)"),
+                &[&todo_id, &parent.as_uuid()],
+            )
+            .await
+            .map_err(|_| StorageError::Database {
+                operation: "todo relationship write",
+            })?;
+    }
+    for dependency in todo.dependency_ids() {
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO {dependencies} (dependent_id, prerequisite_id) VALUES ($1, $2)"
+                ),
+                &[&todo_id, &dependency.as_uuid()],
+            )
+            .await
+            .map_err(|_| StorageError::Database {
+                operation: "todo relationship write",
+            })?;
+    }
+    for tag in todo.tag_ids() {
+        client
+            .execute(
+                &format!("INSERT INTO {tags} (todo_id, tag_id) VALUES ($1, $2)"),
+                &[&todo_id, &tag.as_uuid()],
+            )
+            .await
+            .map_err(|_| StorageError::Database {
+                operation: "todo relationship write",
+            })?;
+    }
+    Ok(())
+}
+
+async fn load_todo_relationships<C: GenericClient + Sync>(
+    client: &C,
+    schema: &AuthoritySchema,
+    todo: Todo,
+) -> Result<Todo, StorageError> {
+    let id = todo.id().as_uuid();
+    let parent_table = schema.table("todo_parents");
+    let dependency_table = schema.table("todo_dependencies");
+    let tag_table = schema.table("todo_tags");
+    let parent = client
+        .query_opt(
+            &format!("SELECT parent_id FROM {parent_table} WHERE child_id = $1"),
+            &[&id],
+        )
+        .await
+        .map_err(|_| StorageError::Database {
+            operation: "todo relationship read",
+        })?
+        .map(|row| TodoId::from_uuid(row.get(0)));
+    let dependencies = client.query(
+        &format!("SELECT prerequisite_id FROM {dependency_table} WHERE dependent_id = $1 ORDER BY prerequisite_id"), &[&id]
+    ).await.map_err(|_| StorageError::Database { operation: "todo relationship read" })?
+        .into_iter().map(|row| TodoId::from_uuid(row.get(0))).collect();
+    let tags = client
+        .query(
+            &format!("SELECT tag_id FROM {tag_table} WHERE todo_id = $1 ORDER BY tag_id"),
+            &[&id],
+        )
+        .await
+        .map_err(|_| StorageError::Database {
+            operation: "todo relationship read",
+        })?
+        .into_iter()
+        .map(|row| TagId::from_uuid(row.get(0)))
+        .collect();
+    Todo::new(
+        todo.id(),
+        todo.title().to_owned(),
+        todo.project_id(),
+        parent,
+        tags,
+        dependencies,
+        todo.lifecycle(),
+        todo.version(),
+        todo.created_at(),
+        todo.updated_at(),
+    )
+    .map_err(StorageError::Domain)
 }
 
 async fn validate_todo_project<C: GenericClient + Sync>(
@@ -1534,10 +1761,10 @@ pub async fn export_authority(database_url: &DatabaseUrl) -> Result<AuthorityExp
         .iter()
         .map(tag_from_row)
         .collect::<Result<Vec<_>, _>>()?;
-    let todos = todo_rows
-        .iter()
-        .map(todo_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut todos = Vec::with_capacity(todo_rows.len());
+    for row in &todo_rows {
+        todos.push(load_todo_relationships(&transaction, &schema, todo_from_row(row)?).await?);
+    }
     transaction
         .commit()
         .await
