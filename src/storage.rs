@@ -14,6 +14,8 @@ pub const TODO_MIGRATION: &str = include_str!("../migrations/0003_todo_authority
 pub const TODO_TAG_MIGRATION: &str = include_str!("../migrations/0004_todo_tag_authority.sql");
 pub const AUTHORITY_REVISION_MIGRATION: &str =
     include_str!("../migrations/0005_authority_revision.sql");
+pub const TODO_RELATIONSHIP_MIGRATION: &str =
+    include_str!("../migrations/0006_todo_relationship_authority.sql");
 const LEDGER: &str = "mg_todo_schema_migrations";
 const MIGRATION_LOCK: i64 = 73_407_463_646;
 
@@ -61,6 +63,13 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: AUTHORITY_REVISION_MIGRATION,
         checksum: "680eaac3aac4b42fe2db5e0e681df0a1b4eb4d5170d7751b1a4f0b84e6f9239d",
         table: "mg_todo_authority_state",
+    },
+    Migration {
+        version: 6,
+        name: "todo_relationship_authority",
+        sql: TODO_RELATIONSHIP_MIGRATION,
+        checksum: "9eca75aa95299df898d1bc7e1a0d27fa54de43b04d94e8e7ed0eda0809ecf36d",
+        table: "todo_parents",
     },
 ];
 
@@ -586,6 +595,10 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             ("revision", "int8", "NO", None),
             ("changed_at", "timestamptz", "NO", None),
         ],
+        6 => vec![
+            ("child_id", "uuid", "NO", None),
+            ("parent_id", "uuid", "NO", None),
+        ],
         _ => unreachable!("known migrations only"),
     };
     if actual
@@ -662,6 +675,12 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             "PRIMARY KEY (singleton)",
             "CHECK (singleton)",
             "CHECK (revision >= 1)",
+        ],
+        6 => vec![
+            "PRIMARY KEY (child_id)",
+            "FOREIGN KEY (child_id) REFERENCES todos(id) ON DELETE CASCADE",
+            "FOREIGN KEY (parent_id) REFERENCES todos(id) ON DELETE RESTRICT",
+            "CHECK (child_id <> parent_id)",
         ],
         _ => unreachable!("known migrations only"),
     };
