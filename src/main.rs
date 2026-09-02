@@ -44,6 +44,16 @@ enum Command {
         #[command(subcommand)]
         command: TodoCommand,
     },
+    Interop {
+        #[command(subcommand)]
+        command: InteropCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum InteropCommand {
+    /// Export a complete validated mg-todo snapshot
+    Export,
 }
 
 #[derive(Debug, Subcommand)]
@@ -168,6 +178,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Todo { command } => {
             run_todo(PostgresTodoRepository::new(database_url), command).await
         }
+        Command::Interop { command } => match command {
+            InteropCommand::Export => print_json(&mg_todo::interop::export(&database_url).await?),
+        },
     }
 }
 

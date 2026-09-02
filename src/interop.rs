@@ -1,0 +1,264 @@
+use crate::config::DatabaseUrl;
+use crate::storage::{AuthorityExport, StorageError, export_authority};
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+const SCHEMA: &str = "mg.interop/1";
+const APP: &str = "mg-todo";
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Snapshot {
+    pub interop_schema: String,
+    pub kind: String,
+    pub producer: Producer,
+    pub export_id: String,
+    pub created_at: DateTime<Utc>,
+    pub source_revision: String,
+    pub producer_revision: u64,
+    pub completeness: Completeness,
+    pub records: Vec<Record>,
+    pub links: Vec<Link>,
+    pub provenance: Vec<Provenance>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Producer {
+    pub app: String,
+    pub app_version: String,
+}
+#[derive(Debug, Serialize)]
+pub struct Completeness {
+    pub complete: bool,
+    pub expected_records: usize,
+    pub expected_links: usize,
+}
+#[derive(Debug, Serialize)]
+pub struct Record {
+    pub global_id: String,
+    pub origin: Origin,
+    pub revision: i64,
+    pub observed_at: DateTime<Utc>,
+    pub lifecycle: Lifecycle,
+    pub payload: serde_json::Value,
+}
+#[derive(Debug, Serialize)]
+pub struct Origin {
+    pub app: String,
+    pub kind: String,
+    pub local_id: String,
+}
+#[derive(Debug, Serialize)]
+pub struct Lifecycle {
+    pub state: String,
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub tombstoned_at: Option<DateTime<Utc>>,
+    pub trashed_at: Option<DateTime<Utc>>,
+    pub archived_at: Option<DateTime<Utc>>,
+    pub purged: bool,
+}
+#[derive(Debug, Serialize)]
+pub struct Link {
+    pub link_id: String,
+    pub source_global_id: String,
+    pub target_global_id: String,
+    pub relation: String,
+    pub created_by: String,
+    pub created_at: Option<DateTime<Utc>>,
+    pub provenance: String,
+}
+#[derive(Debug, Serialize)]
+pub struct Provenance {
+    pub source: String,
+    pub boundary: String,
+}
+#[derive(Debug, Serialize)]
+pub struct Diagnostic {
+    pub severity: String,
+    pub code: String,
+    pub message: String,
+}
+
+pub async fn export(database_url: &DatabaseUrl) -> Result<Snapshot, StorageError> {
+    let AuthorityExport {
+        projects,
+        tags,
+        todos,
+        revision,
+    } = export_authority(database_url).await?;
+    let mut records = Vec::with_capacity(projects.len() + tags.len() + todos.len());
+    let mut links = Vec::new();
+    for project in projects {
+        let id = project.id().to_string();
+        records.push(Record {
+            global_id: format!("{APP}:project:{id}"),
+            origin: Origin {
+                app: APP.into(),
+                kind: "project".into(),
+                local_id: id,
+            },
+            revision: i64::try_from(project.version().value()).map_err(|_| {
+                StorageError::Database {
+                    operation: "interop export",
+                }
+            })?,
+            observed_at: project.updated_at(),
+            lifecycle: lifecycle(project.lifecycle(), None),
+            payload: serde_json::to_value(project).map_err(|_| StorageError::Database {
+                operation: "interop export",
+            })?,
+        });
+    }
+    for tag in tags {
+        let id = tag.id().to_string();
+        records.push(Record {
+            global_id: format!("{APP}:tag:{id}"),
+            origin: Origin {
+                app: APP.into(),
+                kind: "tag".into(),
+                local_id: id,
+            },
+            revision: i64::try_from(tag.version().value()).map_err(|_| StorageError::Database {
+                operation: "interop export",
+            })?,
+            observed_at: tag.updated_at(),
+            lifecycle: Lifecycle {
+                state: "active".into(),
+                deleted_at: None,
+                tombstoned_at: None,
+                trashed_at: None,
+                archived_at: None,
+                purged: false,
+            },
+            payload: serde_json::to_value(tag).map_err(|_| StorageError::Database {
+                operation: "interop export",
+            })?,
+        });
+    }
+    for todo in todos {
+        let id = todo.id().to_string();
+        let todo_global = format!("{APP}:todo:{id}");
+        if let Some(project_id) = todo.project_id() {
+            links.push(link(
+                &format!("{APP}:project:{project_id}"),
+                &todo_global,
+                "project_contains_todo",
+            ));
+        }
+        let parent = todo.parent_id();
+        if let Some(parent_id) = parent {
+            links.push(link(
+                &format!("{APP}:todo:{parent_id}"),
+                &todo_global,
+                "todo_parent",
+            ));
+        }
+        for dependency_id in todo.dependency_ids() {
+            links.push(link(
+                &todo_global,
+                &format!("{APP}:todo:{dependency_id}"),
+                "todo_depends_on",
+            ));
+        }
+        for tag_id in todo.tag_ids() {
+            links.push(link(
+                &todo_global,
+                &format!("{APP}:tag:{tag_id}"),
+                "todo_tagged",
+            ));
+        }
+        records.push(Record {
+            global_id: todo_global,
+            origin: Origin {
+                app: APP.into(),
+                kind: "todo".into(),
+                local_id: id,
+            },
+            revision: i64::try_from(todo.version().value()).map_err(|_| {
+                StorageError::Database {
+                    operation: "interop export",
+                }
+            })?,
+            observed_at: todo.updated_at(),
+            lifecycle: lifecycle(todo.lifecycle(), None),
+            payload: serde_json::to_value(todo).map_err(|_| StorageError::Database {
+                operation: "interop export",
+            })?,
+        });
+    }
+    records.sort_by(|a, b| a.global_id.cmp(&b.global_id));
+    links.sort_by(|a, b| a.link_id.cmp(&b.link_id));
+    let created_at = records
+        .iter()
+        .map(|r| r.observed_at)
+        .max()
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+    let identity = serde_json::json!({ "interop_schema": SCHEMA, "kind": "snapshot", "producer": {"app": APP, "app_version": env!("CARGO_PKG_VERSION")}, "created_at": created_at, "records": &records, "links": &links });
+    let digest = digest(
+        &serde_json::to_vec(&identity).map_err(|_| StorageError::Database {
+            operation: "interop export",
+        })?,
+    );
+    Ok(Snapshot {
+        interop_schema: SCHEMA.into(),
+        kind: "snapshot".into(),
+        producer: Producer {
+            app: APP.into(),
+            app_version: env!("CARGO_PKG_VERSION").into(),
+        },
+        export_id: format!("{APP}:snapshot:{digest}"),
+        created_at,
+        source_revision: digest,
+        producer_revision: revision,
+        completeness: Completeness {
+            complete: true,
+            expected_records: records.len(),
+            expected_links: links.len(),
+        },
+        records,
+        links,
+        provenance: vec![Provenance {
+            source: APP.into(),
+            boundary: "authoritative read-only PostgreSQL repeatable-read transaction".into(),
+        }],
+        diagnostics: vec![Diagnostic {
+            severity: "info".into(),
+            code: "purged_absence".into(),
+            message: "Purged rows are absent from the authority export.".into(),
+        }],
+    })
+}
+
+fn lifecycle(value: crate::domain::Lifecycle, trashed_at: Option<DateTime<Utc>>) -> Lifecycle {
+    let (state, trashed_at) = match value {
+        crate::domain::Lifecycle::Open | crate::domain::Lifecycle::Completed => ("active", None),
+        crate::domain::Lifecycle::Trashed => ("trashed", trashed_at),
+    };
+    Lifecycle {
+        state: state.into(),
+        deleted_at: None,
+        tombstoned_at: None,
+        trashed_at,
+        archived_at: None,
+        purged: false,
+    }
+}
+fn link(source: &str, target: &str, relation: &str) -> Link {
+    Link {
+        link_id: format!("{source}--{relation}--{target}"),
+        source_global_id: source.into(),
+        target_global_id: target.into(),
+        relation: relation.into(),
+        created_by: APP.into(),
+        created_at: None,
+        provenance: "mg-todo authoritative relationship".into(),
+    }
+}
+fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}

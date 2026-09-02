@@ -71,6 +71,15 @@ pub struct MigrationState {
     pub applied: bool,
 }
 
+/// One repeatable-read view of all currently persisted todo authority state.
+#[derive(Debug, Clone)]
+pub struct AuthorityExport {
+    pub projects: Vec<Project>,
+    pub tags: Vec<Tag>,
+    pub todos: Vec<Todo>,
+    pub revision: u64,
+}
+
 /// Stable storage failures. Driver errors are intentionally redacted so URLs and
 /// credentials cannot enter display or debug output.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -152,8 +161,8 @@ pub enum StorageError {
     InvalidTodoReplacement { reason: &'static str },
     #[error("todo project {project_id} was not found")]
     TodoProjectNotFound { project_id: ProjectId },
-    #[error("todo tag {tag_id} was not found")]
-    TodoTagNotFound { tag_id: TagId },
+    #[error("authoritative {kind} cannot be represented by the current interop schema")]
+    UnrepresentableAuthority { kind: &'static str },
     #[error("invalid stored todo data")]
     InvalidStoredTodoData,
     #[error(transparent)]
@@ -1442,6 +1451,86 @@ fn project_from_row(row: &Row) -> Result<Project, StorageError> {
         row.get::<_, DateTime<Utc>>(5),
     )
     .map_err(|_| StorageError::InvalidStoredData)
+}
+
+/// Read the complete currently representable authority in one transaction.
+///
+/// Relationship, recurrence, and reminder rows are not fabricated here; each
+/// must be added to the export contract with its own migration and tests.
+pub async fn export_authority(database_url: &DatabaseUrl) -> Result<AuthorityExport, StorageError> {
+    let (mut client, schema) = connect_authority(database_url, "interop export").await?;
+    let transaction = client
+        .transaction()
+        .await
+        .map_err(|_| StorageError::Database {
+            operation: "interop export",
+        })?;
+    let projects_table = schema.table("projects");
+    let tags_table = schema.table("tags");
+    let todos_table = schema.table("todos");
+    let project_rows = transaction
+        .query(
+            &format!("SELECT id, name, lifecycle, version, created_at, updated_at FROM {projects_table} ORDER BY id"),
+            &[],
+        )
+        .await
+        .map_err(|_| StorageError::Database { operation: "interop export" })?;
+    let tag_rows = transaction
+        .query(
+            &format!(
+                "SELECT id, name, version, created_at, updated_at FROM {tags_table} ORDER BY id"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|_| StorageError::Database {
+            operation: "interop export",
+        })?;
+    let todo_rows = transaction
+        .query(
+            &format!("SELECT id, title, project_id, lifecycle, version, created_at, updated_at FROM {todos_table} ORDER BY id"),
+            &[],
+        )
+        .await
+        .map_err(|_| StorageError::Database { operation: "interop export" })?;
+    let state_table = schema.table("mg_todo_authority_state");
+    let revision = transaction
+        .query_opt(
+            &format!("SELECT revision FROM {state_table} WHERE singleton = true"),
+            &[],
+        )
+        .await
+        .map_err(|_| StorageError::Database {
+            operation: "interop export",
+        })?
+        .and_then(|row| u64::try_from(row.get::<_, i64>(0)).ok())
+        .ok_or(StorageError::Database {
+            operation: "interop export",
+        })?;
+    let projects = project_rows
+        .iter()
+        .map(project_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    let tags = tag_rows
+        .iter()
+        .map(tag_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    let todos = todo_rows
+        .iter()
+        .map(todo_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| StorageError::Database {
+            operation: "interop export",
+        })?;
+    Ok(AuthorityExport {
+        projects,
+        tags,
+        todos,
+        revision,
+    })
 }
 
 #[cfg(test)]
