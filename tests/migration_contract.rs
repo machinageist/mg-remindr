@@ -1,6 +1,6 @@
 use mg_todo::storage::{
     AUTHORITY_REVISION_MIGRATION, FOUNDATION_MIGRATION, MIGRATIONS, TAG_MIGRATION,
-    TODO_LIFECYCLE_TIMES_MIGRATION, TODO_MIGRATION, TODO_RECURRENCE_MIGRATION,
+    TODO_DUE_MIGRATION, TODO_LIFECYCLE_TIMES_MIGRATION, TODO_MIGRATION, TODO_RECURRENCE_MIGRATION,
     TODO_RELATIONSHIP_MIGRATION, TODO_REMINDER_DELIVERY_MIGRATION, TODO_REMINDER_MIGRATION,
     TODO_TAG_MIGRATION,
 };
@@ -24,7 +24,7 @@ fn sha256_hex(sql: &str) -> String {
 
 #[test]
 fn foundation_migrations_are_embedded_and_append_only() {
-    assert_eq!(MIGRATIONS.len(), 10);
+    assert_eq!(MIGRATIONS.len(), 11);
     assert_eq!(MIGRATIONS[0].version, 1);
     assert_eq!(MIGRATIONS[0].name, "project_authority");
     assert_eq!(MIGRATIONS[0].sql, FOUNDATION_MIGRATION);
@@ -140,6 +140,20 @@ fn lifecycle_times_migration_extends_todos_without_inventing_history() {
     );
     assert!(!TODO_LIFECYCLE_TIMES_MIGRATION.contains("DROP "));
     assert!(!TODO_LIFECYCLE_TIMES_MIGRATION.contains("UPDATE "));
+}
+
+#[test]
+fn due_migration_extends_todos_with_one_consistent_form() {
+    assert_eq!(MIGRATIONS[10].version, 11);
+    assert_eq!(MIGRATIONS[10].name, "todo_due");
+    assert_eq!(MIGRATIONS[10].sql, TODO_DUE_MIGRATION);
+    assert!(TODO_DUE_MIGRATION.contains("ALTER TABLE todos"));
+    assert!(TODO_DUE_MIGRATION.contains("ADD COLUMN due_date date"));
+    assert!(TODO_DUE_MIGRATION.contains("ADD COLUMN due_at timestamptz"));
+    assert!(TODO_DUE_MIGRATION.contains("ADD COLUMN due_timezone text"));
+    assert_eq!(sha256_hex(TODO_DUE_MIGRATION), MIGRATIONS[10].checksum);
+    assert!(!TODO_DUE_MIGRATION.contains("DROP "));
+    assert!(!TODO_DUE_MIGRATION.contains("UPDATE "));
 }
 
 #[test]

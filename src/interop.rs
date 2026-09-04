@@ -234,7 +234,7 @@ fn todo_payload(todo: &crate::domain::Todo) -> serde_json::Value {
     serde_json::json!({
         "id": todo.id(),
         "title": todo.title(),
-        "due": null,
+        "due": todo.due(),
         "recurrence": null,
         "reminders": [],
         "priority": "none",
@@ -321,6 +321,7 @@ mod tests {
                 timestamp,
                 completed_at,
                 trashed_at,
+                None,
             )
             .unwrap()
         };
@@ -359,6 +360,7 @@ mod tests {
             Version::new(),
             timestamp,
             timestamp,
+            None,
             None,
             None,
         )

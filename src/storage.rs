@@ -1,10 +1,13 @@
 use crate::{
     config::{DatabaseUrl, validate_local_database_url},
-    domain::{DomainError, Lifecycle, Project, ProjectId, Tag, TagId, Todo, TodoId, Version},
+    domain::{
+        DomainError, Lifecycle, Project, ProjectId, Tag, TagId, Todo, TodoDue, TodoId, Version,
+    },
     recurrence::{Frequency, RecurrenceError, Rule},
     reminder::{Channel, DeliveryRecord, Reminder, ReminderError},
 };
 use chrono::{DateTime, NaiveDate, Utc};
+use chrono_tz::Tz;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -24,6 +27,7 @@ pub const TODO_REMINDER_DELIVERY_MIGRATION: &str =
     include_str!("../migrations/0009_todo_reminder_delivery_authority.sql");
 pub const TODO_LIFECYCLE_TIMES_MIGRATION: &str =
     include_str!("../migrations/0010_todo_lifecycle_times.sql");
+pub const TODO_DUE_MIGRATION: &str = include_str!("../migrations/0011_todo_due.sql");
 pub const TODO_REMINDER_MIGRATION: &str =
     include_str!("../migrations/0008_todo_reminder_authority.sql");
 const LEDGER: &str = "mg_todo_schema_migrations";
@@ -118,6 +122,14 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "todo_lifecycle_times",
         sql: TODO_LIFECYCLE_TIMES_MIGRATION,
         checksum: "52136781e923df4fac3924744e45f2d35516a82803450542c692f7bc780dfd27",
+        table: "todos",
+        creates_table: false,
+    },
+    Migration {
+        version: 11,
+        name: "todo_due",
+        sql: TODO_DUE_MIGRATION,
+        checksum: "7eb26c53a3828c0b5f2d76e451f5861a17dd39b80ebc024c9edf97c49f87c25d",
         table: "todos",
         creates_table: false,
     },
@@ -715,6 +727,20 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             ("completed_at", "timestamptz", "YES", None),
             ("trashed_at", "timestamptz", "YES", None),
         ],
+        11 => vec![
+            ("id", "uuid", "NO", None),
+            ("title", "text", "NO", None),
+            ("project_id", "uuid", "YES", None),
+            ("lifecycle", "text", "NO", None),
+            ("version", "int8", "NO", None),
+            ("created_at", "timestamptz", "NO", None),
+            ("updated_at", "timestamptz", "NO", None),
+            ("completed_at", "timestamptz", "YES", None),
+            ("trashed_at", "timestamptz", "YES", None),
+            ("due_date", "date", "YES", None),
+            ("due_at", "timestamptz", "YES", None),
+            ("due_timezone", "text", "YES", None),
+        ],
         _ => unreachable!("known migrations only"),
     };
     if actual
@@ -838,6 +864,20 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             "CHECK ((lifecycle = 'trashed'::text) = (trashed_at IS NOT NULL))",
             "CHECK (completed_at IS NULL OR completed_at >= created_at AND completed_at <= updated_at)",
             "CHECK (trashed_at IS NULL OR trashed_at >= created_at AND trashed_at <= updated_at)",
+        ],
+        11 => vec![
+            "PRIMARY KEY (id)",
+            "FOREIGN KEY (project_id) REFERENCES projects(id)",
+            "CHECK (btrim(title) <> ''::text)",
+            "CHECK (lifecycle = ANY (ARRAY['open'::text, 'completed'::text, 'trashed'::text]))",
+            "CHECK (version >= 1)",
+            "CHECK (updated_at >= created_at)",
+            "CHECK ((lifecycle = 'completed'::text) = (completed_at IS NOT NULL))",
+            "CHECK ((lifecycle = 'trashed'::text) = (trashed_at IS NOT NULL))",
+            "CHECK (completed_at IS NULL OR completed_at >= created_at AND completed_at <= updated_at)",
+            "CHECK (trashed_at IS NULL OR trashed_at >= created_at AND trashed_at <= updated_at)",
+            "CHECK (due_date IS NULL AND due_at IS NULL AND due_timezone IS NULL OR due_timezone IS NOT NULL AND (due_date IS NULL) <> (due_at IS NULL))",
+            "CHECK (due_timezone IS NULL OR btrim(due_timezone) <> ''::text)",
         ],
         _ => unreachable!("known migrations only"),
     };
@@ -1270,13 +1310,14 @@ impl PostgresTodoRepository {
         validate_todo_relationships(&transaction, &schema, todo).await?;
         let todos = schema.table("todos");
         let lifecycle = lifecycle_text(todo.lifecycle());
+        let due = DueColumns::from(todo.due());
         let result = transaction
             .execute(
                 &format!(
                     "INSERT INTO {todos} \
                      (id, title, project_id, lifecycle, version, created_at, updated_at, \
-                     completed_at, trashed_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+                     completed_at, trashed_at, due_date, due_at, due_timezone) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
                 ),
                 &[
                     &todo.id().as_uuid(),
@@ -1288,6 +1329,9 @@ impl PostgresTodoRepository {
                     &todo.updated_at(),
                     &todo.completed_at(),
                     &todo.trashed_at(),
+                    &due.date,
+                    &due.at,
+                    &due.timezone,
                 ],
             )
             .await;
@@ -1320,7 +1364,7 @@ impl PostgresTodoRepository {
             .query_opt(
                 &format!(
                     "SELECT id, title, project_id, lifecycle, version, created_at, updated_at, \
-                     completed_at, trashed_at FROM {todos} WHERE id = $1"
+                     completed_at, trashed_at, due_date, due_at, due_timezone FROM {todos} WHERE id = $1"
                 ),
                 &[&todo_id.as_uuid()],
             )
@@ -1345,7 +1389,7 @@ impl PostgresTodoRepository {
             .query(
                 &format!(
                     "SELECT id, title, project_id, lifecycle, version, created_at, updated_at, \
-                     completed_at, trashed_at FROM {todos} ORDER BY id"
+                     completed_at, trashed_at, due_date, due_at, due_timezone FROM {todos} ORDER BY id"
                 ),
                 &[],
             )
@@ -1377,7 +1421,7 @@ impl PostgresTodoRepository {
             .query_opt(
                 &format!(
                     "SELECT id, title, project_id, lifecycle, version, created_at, updated_at, \
-                     completed_at, trashed_at FROM {todos} WHERE id = $1 FOR UPDATE"
+                     completed_at, trashed_at, due_date, due_at, due_timezone FROM {todos} WHERE id = $1 FOR UPDATE"
                 ),
                 &[&replacement.id().as_uuid()],
             )
@@ -1417,12 +1461,14 @@ impl PostgresTodoRepository {
         validate_todo_project(&transaction, &schema, replacement.project_id()).await?;
         validate_todo_relationships(&transaction, &schema, replacement).await?;
         let lifecycle = lifecycle_text(replacement.lifecycle());
+        let due = DueColumns::from(replacement.due());
         let changed = transaction
             .execute(
                 &format!(
                     "UPDATE {todos} SET title = $1, project_id = $2, lifecycle = $3, \
-                     version = $4, updated_at = $5, completed_at = $6, trashed_at = $7 \
-                     WHERE id = $8 AND version = $9"
+                     version = $4, updated_at = $5, completed_at = $6, trashed_at = $7, \
+                     due_date = $8, due_at = $9, due_timezone = $10 \
+                     WHERE id = $11 AND version = $12"
                 ),
                 &[
                     &replacement.title(),
@@ -1432,6 +1478,9 @@ impl PostgresTodoRepository {
                     &replacement.updated_at(),
                     &replacement.completed_at(),
                     &replacement.trashed_at(),
+                    &due.date,
+                    &due.at,
+                    &due.timezone,
                     &replacement.id().as_uuid(),
                     &todo_database_version(expected)?,
                 ],
@@ -1664,6 +1713,7 @@ async fn load_todo_relationships<C: GenericClient + Sync>(
         todo.updated_at(),
         todo.completed_at(),
         todo.trashed_at(),
+        todo.due().cloned(),
     )
     .map_err(StorageError::Domain)
 }
@@ -1721,6 +1771,7 @@ fn revalidate_todo(todo: &Todo) -> Result<(), StorageError> {
         todo.updated_at(),
         todo.completed_at(),
         todo.trashed_at(),
+        todo.due().cloned(),
     )?;
     Ok(())
 }
@@ -1763,8 +1814,61 @@ fn todo_from_row(row: &Row) -> Result<Todo, StorageError> {
         row.get::<_, DateTime<Utc>>(6),
         row.get::<_, Option<DateTime<Utc>>>(7),
         row.get::<_, Option<DateTime<Utc>>>(8),
+        due_from_row(row)?,
     )
     .map_err(|_| StorageError::InvalidStoredTodoData)
+}
+
+/// The three nullable columns one due value occupies.
+struct DueColumns {
+    date: Option<NaiveDate>,
+    at: Option<DateTime<Utc>>,
+    timezone: Option<String>,
+}
+
+impl From<Option<&TodoDue>> for DueColumns {
+    fn from(due: Option<&TodoDue>) -> Self {
+        match due {
+            None => Self {
+                date: None,
+                at: None,
+                timezone: None,
+            },
+            Some(TodoDue::Date { date, timezone }) => Self {
+                date: Some(*date),
+                at: None,
+                timezone: Some(timezone.clone()),
+            },
+            Some(TodoDue::Timed { at, timezone }) => Self {
+                date: None,
+                at: Some(at.with_timezone(&Utc)),
+                timezone: Some(timezone.clone()),
+            },
+        }
+    }
+}
+
+// The stored instant is reprojected into its own zone, so the exported offset is the zone's
+fn due_from_row(row: &Row) -> Result<Option<TodoDue>, StorageError> {
+    let date = row.get::<_, Option<NaiveDate>>(9);
+    let at = row.get::<_, Option<DateTime<Utc>>>(10);
+    let timezone = row.get::<_, Option<String>>(11);
+    match (date, at, timezone) {
+        (None, None, None) => Ok(None),
+        (Some(date), None, Some(timezone)) => TodoDue::date(date, timezone)
+            .map(Some)
+            .map_err(|_| StorageError::InvalidStoredTodoData),
+        (None, Some(at), Some(timezone)) => {
+            let zone = timezone
+                .parse::<Tz>()
+                .map_err(|_| StorageError::InvalidStoredTodoData)?;
+            let zoned = at.with_timezone(&zone);
+            TodoDue::timed(zoned.fixed_offset(), timezone)
+                .map(Some)
+                .map_err(|_| StorageError::InvalidStoredTodoData)
+        }
+        _ => Err(StorageError::InvalidStoredTodoData),
+    }
 }
 
 fn revalidate_tag(tag: &Tag) -> Result<(), StorageError> {
@@ -2097,7 +2201,8 @@ pub async fn export_authority(database_url: &DatabaseUrl) -> Result<AuthorityExp
         .query(
             &format!(
                 "SELECT id, title, project_id, lifecycle, version, created_at, updated_at, \
-                 completed_at, trashed_at FROM {todos_table} ORDER BY id"
+                 completed_at, trashed_at, due_date, due_at, due_timezone \
+                 FROM {todos_table} ORDER BY id"
             ),
             &[],
         )

@@ -1,4 +1,5 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, Offset, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{fmt, str::FromStr};
 use thiserror::Error;
@@ -27,6 +28,10 @@ pub enum DomainError {
     },
     #[error("{field} must fall between created_at and updated_at")]
     TransitionTimeOutsideHistory { field: &'static str },
+    #[error("due timezone must be a named IANA zone")]
+    InvalidDueTimezone,
+    #[error("due offset does not match its IANA timezone at that instant")]
+    DueOffsetTimezoneMismatch,
 }
 macro_rules! id {
     ($name:ident, $kind:literal) => {
@@ -149,6 +154,54 @@ pub struct Tag {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
+/// A due value in the externally tagged shape the mg-calr projection consumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TodoDue {
+    Date {
+        date: NaiveDate,
+        timezone: String,
+    },
+    Timed {
+        at: DateTime<FixedOffset>,
+        timezone: String,
+    },
+}
+
+impl TodoDue {
+    /// Build an all-day due value in a named zone.
+    pub fn date(date: NaiveDate, timezone: String) -> Result<Self, DomainError> {
+        let timezone = named_zone(timezone)?.0;
+        Ok(Self::Date { date, timezone })
+    }
+    /// Build a timed due value whose offset must agree with its zone at that instant.
+    pub fn timed(at: DateTime<FixedOffset>, timezone: String) -> Result<Self, DomainError> {
+        let (timezone, zone) = named_zone(timezone)?;
+        if at.with_timezone(&zone).offset().fix() != *at.offset() {
+            return Err(DomainError::DueOffsetTimezoneMismatch);
+        }
+        Ok(Self::Timed { at, timezone })
+    }
+    /// Revalidate a due value that arrived from storage or the wire.
+    pub fn revalidated(self) -> Result<Self, DomainError> {
+        match self {
+            Self::Date { date, timezone } => Self::date(date, timezone),
+            Self::Timed { at, timezone } => Self::timed(at, timezone),
+        }
+    }
+    pub fn timezone(&self) -> &str {
+        match self {
+            Self::Date { timezone, .. } | Self::Timed { timezone, .. } => timezone,
+        }
+    }
+}
+
+fn named_zone(timezone: String) -> Result<(String, Tz), DomainError> {
+    let zone = timezone
+        .parse::<Tz>()
+        .map_err(|_| DomainError::InvalidDueTimezone)?;
+    Ok((timezone, zone))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Todo {
     id: TodoId,
@@ -163,6 +216,7 @@ pub struct Todo {
     updated_at: DateTime<Utc>,
     completed_at: Option<DateTime<Utc>>,
     trashed_at: Option<DateTime<Utc>>,
+    due: Option<TodoDue>,
 }
 
 #[derive(Deserialize)]
@@ -198,6 +252,8 @@ struct TodoWire {
     completed_at: Option<DateTime<Utc>>,
     #[serde(default)]
     trashed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    due: Option<TodoDue>,
 }
 impl<'de> Deserialize<'de> for Project {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -236,6 +292,7 @@ impl<'de> Deserialize<'de> for Todo {
             w.updated_at,
             w.completed_at,
             w.trashed_at,
+            w.due,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -330,11 +387,13 @@ impl Todo {
         updated_at: DateTime<Utc>,
         completed_at: Option<DateTime<Utc>>,
         trashed_at: Option<DateTime<Utc>>,
+        due: Option<TodoDue>,
     ) -> Result<Self, DomainError> {
         if updated_at < created_at {
             return Err(DomainError::InvalidTimestamps);
         }
         validate_transition_times(lifecycle, completed_at, trashed_at, created_at, updated_at)?;
+        let due = due.map(TodoDue::revalidated).transpose()?;
         Ok(Self {
             id,
             title: valid_text(&title, "todo title")?,
@@ -348,6 +407,7 @@ impl Todo {
             updated_at,
             completed_at,
             trashed_at,
+            due,
         })
     }
     pub fn title(&self) -> &str {
@@ -385,6 +445,9 @@ impl Todo {
     }
     pub const fn trashed_at(&self) -> Option<DateTime<Utc>> {
         self.trashed_at
+    }
+    pub const fn due(&self) -> Option<&TodoDue> {
+        self.due.as_ref()
     }
 }
 
@@ -530,6 +593,7 @@ mod tests {
                 earlier,
                 None,
                 None,
+                None,
             ),
             Err(DomainError::InvalidTimestamps)
         );
@@ -559,6 +623,7 @@ mod tests {
                 updated_at,
                 completed_at,
                 trashed_at,
+                None,
             )
         };
         assert!(todo(Lifecycle::Open, None, None).is_ok());
@@ -606,6 +671,52 @@ mod tests {
                 field: "trashed_at"
             })
         );
+    }
+
+    #[test]
+    fn due_values_validate_their_zone_and_offset() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 5).unwrap();
+        assert!(TodoDue::date(date, "America/New_York".to_owned()).is_ok());
+        assert_eq!(
+            TodoDue::date(date, "Mars/Olympus".to_owned()),
+            Err(DomainError::InvalidDueTimezone)
+        );
+        assert_eq!(
+            TodoDue::date(date, String::new()),
+            Err(DomainError::InvalidDueTimezone)
+        );
+
+        let eastern: DateTime<FixedOffset> = "2026-09-05T14:00:00-04:00".parse().unwrap();
+        assert!(TodoDue::timed(eastern, "America/New_York".to_owned()).is_ok());
+        assert_eq!(
+            TodoDue::timed(eastern, "Europe/Berlin".to_owned()),
+            Err(DomainError::DueOffsetTimezoneMismatch)
+        );
+        // Winter in New York is -05:00, so a summer offset is rejected out of season
+        let winter: DateTime<FixedOffset> = "2026-01-05T14:00:00-04:00".parse().unwrap();
+        assert_eq!(
+            TodoDue::timed(winter, "America/New_York".to_owned()),
+            Err(DomainError::DueOffsetTimezoneMismatch)
+        );
+    }
+
+    #[test]
+    fn todo_due_round_trips_through_the_projection_shape() {
+        let json = r#"{"Date":{"date":"2026-09-05","timezone":"America/New_York"}}"#;
+        let due: TodoDue = serde_json::from_str(json).unwrap();
+        assert_eq!(due.timezone(), "America/New_York");
+        assert_eq!(serde_json::to_string(&due).unwrap(), json);
+
+        let id = TodoId::new();
+        let with_due = format!(
+            r#"{{"id":"{id}","title":"todo","project_id":null,"parent_id":null,"tag_ids":[],"dependency_ids":[],"lifecycle":"open","version":1,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","due":{json}}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Todo>(&with_due).unwrap().due(),
+            Some(&due)
+        );
+        let bad_zone = with_due.replace("America/New_York", "Mars/Olympus");
+        assert!(serde_json::from_str::<Todo>(&bad_zone).is_err());
     }
 
     #[test]
