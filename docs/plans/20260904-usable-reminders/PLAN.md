@@ -40,12 +40,18 @@ Verification: focused tests, then a live round trip proving a dated todo reaches
 
 ## Slice 3: human CLI
 
-- `src/main.rs`: `todo add --title --due --timezone --project`, `todo ls`,
-  `todo done <id>`, `todo rm <id>`, resolving version and timestamps internally and
-  accepting an unambiguous ID prefix.
+- `src/main.rs`: top-level `add`, `ls`, `done`, and `rm`, resolving identity,
+  version, and timestamps internally and accepting an unambiguous ID prefix. They
+  sit beside `todo create|find|list|replace`, which stays the automation surface.
+- `--due` accepts `today`, `tomorrow`, a civil date, or a date and local time.
+  `--timezone` defaults to the system zone, resolved from `TZ` or `/etc/localtime`,
+  and fails closed rather than silently assuming UTC.
+- Human output by default, `--json` for automation.
+- `--project` is deferred: project selection is not required to keep a reminder,
+  and projects have no human creation surface yet.
 
-Verification: CLI contract tests covering happy path, ambiguous prefix, unknown ID,
-and stale write.
+Verification: CLI contract tests covering due parsing, zone resolution, ambiguous
+prefix, and unknown ID.
 
 ## Slice 4: local database defaults
 

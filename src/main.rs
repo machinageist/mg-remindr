@@ -1,7 +1,8 @@
 use clap::{Args, Parser, Subcommand};
 use mg_todo::{
     config::{Config, DatabaseUrl},
-    domain::{Project, ProjectId, Tag, TagId, Todo, TodoId, Version},
+    domain::{Lifecycle, Project, ProjectId, Tag, TagId, Todo, TodoId, Version},
+    human,
     storage::{
         PostgresProjectRepository, PostgresTagRepository, PostgresTodoRepository, migrate,
         migration_status,
@@ -48,6 +49,48 @@ enum Command {
         #[command(subcommand)]
         command: InteropCommand,
     },
+    /// Keep a reminder, resolving its identity, version, and timestamps
+    Add(AddInput),
+    /// List reminders, open ones by default
+    Ls(ListInput),
+    /// Complete one reminder by ID or unambiguous prefix
+    Done(HandleInput),
+    /// Trash one reminder by ID or unambiguous prefix
+    Rm(HandleInput),
+}
+
+#[derive(Debug, Args)]
+struct AddInput {
+    /// What the reminder is
+    title: String,
+    /// today, tomorrow, YYYY-MM-DD, or YYYY-MM-DDTHH:MM
+    #[arg(long)]
+    due: Option<String>,
+    /// IANA zone the due value is written in; defaults to the system zone
+    #[arg(long)]
+    timezone: Option<String>,
+    /// Emit the stored domain object as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ListInput {
+    /// Include completed and trashed reminders
+    #[arg(long)]
+    all: bool,
+    /// Emit stored domain objects as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct HandleInput {
+    /// The listed handle, or any unambiguous part of an identifier
+    handle: String,
+    /// Emit the stored domain object as JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -142,6 +185,8 @@ enum CliError {
     Output,
     #[error("runtime initialization failed")]
     Runtime,
+    #[error(transparent)]
+    Human(#[from] human::HumanError),
 }
 
 fn main() -> ExitCode {
@@ -181,7 +226,95 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Command::Interop { command } => match command {
             InteropCommand::Export => print_json(&mg_todo::interop::export(&database_url).await?),
         },
+        Command::Add(input) => add(PostgresTodoRepository::new(database_url), input).await,
+        Command::Ls(input) => list(PostgresTodoRepository::new(database_url), input).await,
+        Command::Done(input) => {
+            close(
+                PostgresTodoRepository::new(database_url),
+                Lifecycle::Completed,
+                input,
+            )
+            .await
+        }
+        Command::Rm(input) => {
+            close(
+                PostgresTodoRepository::new(database_url),
+                Lifecycle::Trashed,
+                input,
+            )
+            .await
+        }
     }
+}
+
+async fn add(repository: PostgresTodoRepository, input: AddInput) -> Result<(), CliError> {
+    let at = human::now();
+    let due = match input.due {
+        None => None,
+        Some(value) => {
+            let zone = human::resolve_zone(input.timezone.as_deref())?;
+            let today = human::today_in(&zone, at)?;
+            Some(human::parse_due(&value, &zone, today)?)
+        }
+    };
+    let todo = human::new_todo(input.title, due, at)?;
+    repository.create(&todo).await?;
+    if input.json {
+        return print_json(&todo);
+    }
+    println!("{}", human::render(&todo));
+    Ok(())
+}
+
+async fn list(repository: PostgresTodoRepository, input: ListInput) -> Result<(), CliError> {
+    let mut todos = repository.list().await?;
+    if !input.all {
+        todos.retain(|todo| todo.lifecycle() == Lifecycle::Open);
+    }
+    if input.json {
+        return print_json(&todos);
+    }
+    if todos.is_empty() {
+        println!("no reminders");
+        return Ok(());
+    }
+    // Undated reminders sort after dated ones, which is the order a day is read in
+    todos.sort_by_key(|todo| (todo.due().is_none(), due_key(todo), todo.title().to_owned()));
+    for todo in &todos {
+        println!("{}", human::render(todo));
+    }
+    Ok(())
+}
+
+fn due_key(todo: &Todo) -> String {
+    match todo.due() {
+        None => String::new(),
+        Some(mg_todo::domain::TodoDue::Date { date, .. }) => format!("{date}T00:00"),
+        Some(mg_todo::domain::TodoDue::Timed { at, .. }) => at.to_rfc3339(),
+    }
+}
+
+async fn close(
+    repository: PostgresTodoRepository,
+    lifecycle: Lifecycle,
+    input: HandleInput,
+) -> Result<(), CliError> {
+    let todos = repository.list().await?;
+    let id = human::resolve_handle(&todos, &input.handle)?;
+    let current = todos
+        .iter()
+        .find(|todo| todo.id() == id)
+        .ok_or(CliError::NotFound {
+            kind: "todo",
+            id: input.handle.clone(),
+        })?;
+    let replacement = human::close(current, lifecycle, human::now())?;
+    repository.replace(current.version(), &replacement).await?;
+    if input.json {
+        return print_json(&replacement);
+    }
+    println!("{}", human::render(&replacement));
+    Ok(())
 }
 
 fn database_url(argument: Option<String>) -> Result<DatabaseUrl, CliError> {
