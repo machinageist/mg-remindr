@@ -1,6 +1,6 @@
 # Usable reminders specification
 
-Status: active change specification
+Status: slices 1-4 delivered and verified end to end against the local authority
 
 ## Desired outcome
 
@@ -72,6 +72,22 @@ without weakening the local-only boundary.
    non-loopback URL is still rejected.
 6. Focused tests, all targets, strict Clippy, formatting, and diff hygiene pass,
    with the disposable-PostgreSQL suite enabled.
+
+## Delivered
+
+All four slices are implemented, and the acceptance criteria were walked against
+the live `mg_todo` and `mg_calr` databases through the suite's own
+`geist-sync-todo-projection` bridge: a reminder added with `mg-todo add` appears on
+`mg-calr agenda` for its day in the requested zone, and completing it removes it.
+
+`mg-calr`'s agenda rendering was repaired alongside, in that repository.
+
+## Remaining
+
+- No CLI restores a trashed reminder; `todo replace` is the only route back.
+- Recurrence and reminder delivery have persistence but are absent from the todo
+  aggregate and its export.
+- Projection refresh is manual, by design.
 
 ## Non-goals
 
