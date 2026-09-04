@@ -57,6 +57,8 @@ enum Command {
     Done(HandleInput),
     /// Trash one reminder by ID or unambiguous prefix
     Rm(HandleInput),
+    /// Return one completed or trashed reminder to the open list
+    Restore(HandleInput),
 }
 
 #[derive(Debug, Args)]
@@ -242,7 +244,31 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             )
             .await
         }
+        Command::Restore(input) => reopen(PostgresTodoRepository::new(database_url), input).await,
     }
+}
+
+fn resolve<'a>(todos: &'a [Todo], token: &str) -> Result<&'a Todo, CliError> {
+    let id = human::resolve_handle(todos, token)?;
+    todos
+        .iter()
+        .find(|todo| todo.id() == id)
+        .ok_or(CliError::NotFound {
+            kind: "todo",
+            id: token.to_owned(),
+        })
+}
+
+async fn reopen(repository: PostgresTodoRepository, input: HandleInput) -> Result<(), CliError> {
+    let todos = repository.list().await?;
+    let current = resolve(&todos, &input.handle)?;
+    let replacement = human::reopen(current, human::now())?;
+    repository.replace(current.version(), &replacement).await?;
+    if input.json {
+        return print_json(&replacement);
+    }
+    println!("{}", human::render(&replacement));
+    Ok(())
 }
 
 async fn add(repository: PostgresTodoRepository, input: AddInput) -> Result<(), CliError> {
@@ -298,14 +324,7 @@ async fn close(
     input: HandleInput,
 ) -> Result<(), CliError> {
     let todos = repository.list().await?;
-    let id = human::resolve_handle(&todos, &input.handle)?;
-    let current = todos
-        .iter()
-        .find(|todo| todo.id() == id)
-        .ok_or(CliError::NotFound {
-            kind: "todo",
-            id: input.handle.clone(),
-        })?;
+    let current = resolve(&todos, &input.handle)?;
     let replacement = human::close(current, lifecycle, human::now())?;
     repository.replace(current.version(), &replacement).await?;
     if input.json {

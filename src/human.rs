@@ -21,6 +21,7 @@ pub enum HumanError {
     NoMatch(String),
     Ambiguous(String, Vec<String>),
     AlreadyClosed(&'static str),
+    AlreadyOpen,
     Domain(DomainError),
 }
 
@@ -42,6 +43,7 @@ impl fmt::Display for HumanError {
                 matches.join(", ")
             ),
             Self::AlreadyClosed(lifecycle) => write!(formatter, "todo is already {lifecycle}"),
+            Self::AlreadyOpen => formatter.write_str("todo is already open"),
             Self::Domain(error) => error.fmt(formatter),
         }
     }
@@ -210,6 +212,33 @@ pub fn close(current: &Todo, lifecycle: Lifecycle, at: DateTime<Utc>) -> Result<
         at,
         completed_at,
         trashed_at,
+        current.due().cloned(),
+    )
+    .map_err(HumanError::Domain)
+}
+
+/// Build the replacement that returns one closed todo to the open lifecycle.
+///
+/// # Errors
+/// Returns an error when the todo is already open or the version cannot advance.
+pub fn reopen(current: &Todo, at: DateTime<Utc>) -> Result<Todo, HumanError> {
+    if current.lifecycle() == Lifecycle::Open {
+        return Err(HumanError::AlreadyOpen);
+    }
+    // Clearing both transition times is the point: the todo is neither completed nor trashed
+    Todo::new(
+        current.id(),
+        current.title().to_owned(),
+        current.project_id(),
+        current.parent_id(),
+        current.tag_ids().to_vec(),
+        current.dependency_ids().to_vec(),
+        Lifecycle::Open,
+        current.version().next().map_err(HumanError::Domain)?,
+        current.created_at(),
+        at.max(current.updated_at()),
+        None,
+        None,
         current.due().cloned(),
     )
     .map_err(HumanError::Domain)

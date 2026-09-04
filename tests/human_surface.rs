@@ -1,7 +1,10 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use mg_todo::{
     domain::{Lifecycle, Todo, TodoDue, TodoId, Version},
-    human::{HumanError, close, handle, new_todo, parse_due, render, resolve_handle, resolve_zone},
+    human::{
+        HumanError, close, handle, new_todo, parse_due, render, reopen, resolve_handle,
+        resolve_zone,
+    },
 };
 
 fn instant(value: &str) -> DateTime<Utc> {
@@ -194,4 +197,42 @@ fn rendering_states_the_handle_the_due_value_and_a_closed_lifecycle() {
     )
     .unwrap();
     assert!(render(&done).contains("(done)"));
+}
+
+#[test]
+fn restoring_clears_the_transition_time_and_advances_the_version() {
+    let open = todo("renew passport", None);
+    let closed_at = instant("2026-09-04T13:00:00Z");
+    let reopened_at = instant("2026-09-04T14:00:00Z");
+
+    for lifecycle in [Lifecycle::Completed, Lifecycle::Trashed] {
+        let closed = close(&open, lifecycle, closed_at).unwrap();
+        let restored = reopen(&closed, reopened_at).unwrap();
+        assert_eq!(restored.lifecycle(), Lifecycle::Open);
+        assert_eq!(restored.completed_at(), None);
+        assert_eq!(restored.trashed_at(), None);
+        assert_eq!(restored.version(), Version::try_from_value(3).unwrap());
+        assert_eq!(restored.created_at(), open.created_at());
+        assert_eq!(restored.updated_at(), reopened_at);
+        assert_eq!(restored.title(), open.title());
+    }
+}
+
+#[test]
+fn restoring_keeps_the_due_value_and_refuses_an_open_todo() {
+    let due = TodoDue::date(today(), "America/New_York".to_owned()).unwrap();
+    let open = todo("pay rent", Some(due.clone()));
+    let at = instant("2026-09-04T13:00:00Z");
+
+    let restored = reopen(&close(&open, Lifecycle::Trashed, at).unwrap(), at).unwrap();
+    assert_eq!(restored.due(), Some(&due));
+    assert_eq!(reopen(&open, at), Err(HumanError::AlreadyOpen));
+}
+
+#[test]
+fn a_backward_clock_cannot_move_a_restored_todo_into_its_own_past() {
+    let open = todo("pay rent", None);
+    let closed = close(&open, Lifecycle::Completed, instant("2026-09-04T13:00:00Z")).unwrap();
+    let restored = reopen(&closed, instant("2026-09-04T11:00:00Z")).unwrap();
+    assert_eq!(restored.updated_at(), closed.updated_at());
 }

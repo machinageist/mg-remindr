@@ -14,7 +14,8 @@ fn help_exposes_persistence_workflows_without_database_configuration() {
         .stdout(predicate::str::contains("add"))
         .stdout(predicate::str::contains("ls"))
         .stdout(predicate::str::contains("done"))
-        .stdout(predicate::str::contains("rm"));
+        .stdout(predicate::str::contains("rm"))
+        .stdout(predicate::str::contains("restore"));
 
     cargo_bin_cmd!("mg-todo")
         .args(["project", "--help"])
@@ -79,7 +80,7 @@ fn the_human_surface_needs_no_json_uuid_version_or_timestamp() {
         .stdout(predicate::str::contains("YYYY-MM-DD"))
         .stdout(predicate::str::contains("--json"));
 
-    for command in ["add", "ls", "done", "rm"] {
+    for command in ["add", "ls", "done", "rm", "restore"] {
         let help = cargo_bin_cmd!("mg-todo")
             .args([command, "--help"])
             .assert()

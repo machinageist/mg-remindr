@@ -14,13 +14,15 @@ mg-todo add "Dentist" --due 2026-09-08T14:00
 mg-todo ls
 mg-todo done <handle>
 mg-todo rm <handle>
+mg-todo restore <handle>
 ```
 
 `--due` accepts `today`, `tomorrow`, `YYYY-MM-DD`, or `YYYY-MM-DDTHH:MM`.
 `--timezone` names the IANA zone the due value is written in and defaults to the
 system zone resolved from `TZ` or `/etc/localtime`; a local time that does not
 exist or repeats across a transition is refused rather than guessed. `ls` shows
-open reminders; `--all` includes completed and trashed ones. Add `--json` to any
+open reminders; `--all` includes completed and trashed ones, which is how a
+handle is found for `restore`. Add `--json` to any
 of these for the stored domain object.
 
 The handle in `ls` is the identifier's trailing characters. UUIDv7 leads with a

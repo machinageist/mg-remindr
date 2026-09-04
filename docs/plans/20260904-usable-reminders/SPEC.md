@@ -84,7 +84,6 @@ the live `mg_todo` and `mg_calr` databases through the suite's own
 
 ## Remaining
 
-- No CLI restores a trashed reminder; `todo replace` is the only route back.
 - Recurrence and reminder delivery have persistence but are absent from the todo
   aggregate and its export.
 - Projection refresh is manual, by design.
