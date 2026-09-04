@@ -56,15 +56,15 @@ fn unknown_and_invalid_commands_fail_with_stable_clap_errors() {
 }
 
 #[test]
-fn persistence_command_without_database_url_fails_nonzero() {
+fn a_remote_database_url_is_refused_before_any_connection() {
     cargo_bin_cmd!("mg-todo")
         .args(["migration", "status"])
-        .env_remove("MG_TODO_DATABASE_URL")
+        .env("MG_TODO_DATABASE_URL", "postgres://db.example.com/mg_todo")
         .env("XDG_CONFIG_HOME", "/nonexistent/mg-todo-test-config")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "mg-todo: database URL is required",
+            "mg-todo: invalid database configuration",
         ));
 }
 

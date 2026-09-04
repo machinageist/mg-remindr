@@ -7,6 +7,9 @@ use url::Url;
 const APP: &str = "mg-todo";
 const DB_ENV: &str = "MG_TODO_DATABASE_URL";
 const TEST_ENV: &str = "MG_TODO_ALLOW_INTEGRATION_TESTS";
+// The unconfigured authority is the local peer-authenticated socket, the same shape mg-calr uses
+const DEFAULT_DATABASE: &str = "mg_todo";
+const DEFAULT_SOCKET_DIR: &str = "/run/postgresql";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct DatabaseUrl(String);
@@ -93,6 +96,9 @@ impl Config {
         if let Ok(value) = env::var(DB_ENV) {
             config.database.database_url = Some(DatabaseUrl::parse(value)?);
         }
+        if config.database.database_url.is_none() {
+            config.database.database_url = Some(DatabaseUrl::parse(default_database_url())?);
+        }
         config.validate().map(|()| config)
     }
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -116,6 +122,12 @@ impl fmt::Display for RedactedDatabaseError {
     }
 }
 impl std::error::Error for RedactedDatabaseError {}
+
+/// The local socket authority used when nothing is configured.
+#[must_use]
+pub fn default_database_url() -> String {
+    format!("postgresql:///{DEFAULT_DATABASE}?host={DEFAULT_SOCKET_DIR}")
+}
 
 pub(crate) fn validate_local_database_url(value: &str) -> Result<(), ConfigError> {
     let url = Url::parse(value).map_err(|_| ConfigError::InvalidDatabaseUrl)?;
@@ -223,6 +235,14 @@ mod tests {
         let p = Paths::discover();
         assert!(p.config_dir.ends_with(APP));
         assert!(p.data_dir.ends_with(APP));
+    }
+    #[test]
+    fn the_unconfigured_default_is_a_valid_local_socket_authority() {
+        let url = default_database_url();
+        assert!(url.contains(DEFAULT_DATABASE));
+        assert!(url.contains(DEFAULT_SOCKET_DIR));
+        assert!(validate_local_database_url(&url).is_ok());
+        assert!(DatabaseUrl::parse(url).is_ok());
     }
     #[test]
     fn local_url_validation_is_exact() {

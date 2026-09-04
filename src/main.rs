@@ -167,8 +167,6 @@ struct ReplaceInput {
 
 #[derive(Debug, Error)]
 enum CliError {
-    #[error("database URL is required (--database-url, MG_TODO_DATABASE_URL, or config.toml)")]
-    MissingDatabaseUrl,
     #[error("invalid database configuration")]
     Configuration,
     #[error("invalid {kind} JSON")]
@@ -325,7 +323,7 @@ fn database_url(argument: Option<String>) -> Result<DatabaseUrl, CliError> {
         .map_err(|_| CliError::Configuration)?
         .database
         .database_url
-        .ok_or(CliError::MissingDatabaseUrl)
+        .ok_or(CliError::Configuration)
 }
 
 async fn run_project(
