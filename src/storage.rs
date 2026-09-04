@@ -689,7 +689,7 @@ async fn verify_table_schema<C: GenericClient + Sync>(
              FROM pg_catalog.pg_constraint c \
              JOIN pg_catalog.pg_class t ON t.oid = c.conrelid \
              JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
-             WHERE n.nspname = $1 AND t.relname = $2 AND c.contype IN ('p', 'c', 'f', 'u') \\
+             WHERE n.nspname = $1 AND t.relname = $2 AND c.contype IN ('p', 'c', 'f', 'u') \
              ORDER BY c.contype, c.conname",
             &[&schema.name, &migration.table],
         )
@@ -749,8 +749,8 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             "PRIMARY KEY (todo_id)",
             "FOREIGN KEY (todo_id) REFERENCES todos(id) ON DELETE CASCADE",
             "CHECK (frequency = ANY (ARRAY['DAILY'::text, 'WEEKLY'::text, 'MONTHLY'::text]))",
-            "CHECK (interval >= 1 AND interval <= 366)",
-            "CHECK (occurrence_count >= 1 AND occurrence_count <= 1000 OR occurrence_count IS NULL)",
+            "CHECK (\"interval\" >= 1 AND \"interval\" <= 366)",
+            "CHECK (occurrence_count >= 1 AND occurrence_count <= 1000)",
             "CHECK (occurrence_count IS NOT NULL OR until_date IS NOT NULL)",
             "CHECK (until_date IS NULL OR until_date > start_date)",
         ],

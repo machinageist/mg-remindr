@@ -226,7 +226,7 @@ async fn checksum_ledger_with_deleted_v1_is_rejected_without_reapplying_v1() {
     client
         .batch_execute(
             "DELETE FROM mg_todo_schema_migrations WHERE version = 1; \
-             DROP TABLE projects",
+             DROP TABLE projects CASCADE",
         )
         .await
         .unwrap();
@@ -244,7 +244,13 @@ async fn checksum_ledger_with_deleted_v1_is_rejected_without_reapplying_v1() {
         .into_iter()
         .map(|row| row.get::<_, i64>(0))
         .collect::<Vec<_>>();
-    assert_eq!(versions, [2]);
+    // Every ledger row except the deleted foundation entry must survive untouched
+    let retained = MIGRATIONS
+        .iter()
+        .map(|migration| migration.version)
+        .filter(|version| *version != 1)
+        .collect::<Vec<_>>();
+    assert_eq!(versions, retained);
     let projects_exists: bool = client
         .query_one("SELECT to_regclass('projects') IS NOT NULL", &[])
         .await
