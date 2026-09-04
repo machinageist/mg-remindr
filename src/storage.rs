@@ -22,6 +22,8 @@ pub const TODO_RECURRENCE_MIGRATION: &str =
     include_str!("../migrations/0007_todo_recurrence_authority.sql");
 pub const TODO_REMINDER_DELIVERY_MIGRATION: &str =
     include_str!("../migrations/0009_todo_reminder_delivery_authority.sql");
+pub const TODO_LIFECYCLE_TIMES_MIGRATION: &str =
+    include_str!("../migrations/0010_todo_lifecycle_times.sql");
 pub const TODO_REMINDER_MIGRATION: &str =
     include_str!("../migrations/0008_todo_reminder_authority.sql");
 const LEDGER: &str = "mg_todo_schema_migrations";
@@ -34,6 +36,8 @@ pub struct Migration {
     pub sql: &'static str,
     pub checksum: &'static str,
     pub table: &'static str,
+    /// False when the migration extends a table an earlier migration created
+    pub creates_table: bool,
 }
 
 pub const MIGRATIONS: &[Migration] = &[
@@ -43,6 +47,7 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: FOUNDATION_MIGRATION,
         checksum: "0c821017adbb6c219ad371a7729b7d898a178bd9102279d71524504710ed78c0",
         table: "projects",
+        creates_table: true,
     },
     Migration {
         version: 2,
@@ -50,6 +55,7 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: TAG_MIGRATION,
         checksum: "4d94c603ee44bbb7e649011d49bdd5325f98ff4abcffa232eb8e0a7770286126",
         table: "tags",
+        creates_table: true,
     },
     Migration {
         version: 3,
@@ -57,6 +63,7 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: TODO_MIGRATION,
         checksum: "0f9e31afdb4b2ae562fb065a48b683e0c554cf124ea4e97296ab6630f20af6f2",
         table: "todos",
+        creates_table: true,
     },
     Migration {
         version: 4,
@@ -64,6 +71,7 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: TODO_TAG_MIGRATION,
         checksum: "fffb6336ac6d6c02a39dfcf96333858eab15d947594ac50104dfdae57e358716",
         table: "todo_tags",
+        creates_table: true,
     },
     Migration {
         version: 5,
@@ -71,6 +79,7 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: AUTHORITY_REVISION_MIGRATION,
         checksum: "680eaac3aac4b42fe2db5e0e681df0a1b4eb4d5170d7751b1a4f0b84e6f9239d",
         table: "mg_todo_authority_state",
+        creates_table: true,
     },
     Migration {
         version: 6,
@@ -78,6 +87,7 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: TODO_RELATIONSHIP_MIGRATION,
         checksum: "9eca75aa95299df898d1bc7e1a0d27fa54de43b04d94e8e7ed0eda0809ecf36d",
         table: "todo_parents",
+        creates_table: true,
     },
     Migration {
         version: 7,
@@ -85,6 +95,7 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: TODO_RECURRENCE_MIGRATION,
         checksum: "391adbe0240486d80938eb2651d15dd43736d3e9249608a32701ea82e8d20781",
         table: "todo_recurrence",
+        creates_table: true,
     },
     Migration {
         version: 8,
@@ -92,6 +103,7 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: TODO_REMINDER_MIGRATION,
         checksum: "ae7dcac9333555742d19bb5bdc6dc92810769ef394215181c5577655c5f40b38",
         table: "todo_reminders",
+        creates_table: true,
     },
     Migration {
         version: 9,
@@ -99,6 +111,15 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: TODO_REMINDER_DELIVERY_MIGRATION,
         checksum: "8ce0adab4da891d8e0f152f9907b9db680f32a1b1ae604b57dde173baf31a67f",
         table: "todo_reminder_deliveries",
+        creates_table: true,
+    },
+    Migration {
+        version: 10,
+        name: "todo_lifecycle_times",
+        sql: TODO_LIFECYCLE_TIMES_MIGRATION,
+        checksum: "52136781e923df4fac3924744e45f2d35516a82803450542c692f7bc780dfd27",
+        table: "todos",
+        creates_table: false,
     },
 ];
 
@@ -551,22 +572,43 @@ async fn verify_migration_schemas<C: GenericClient + Sync>(
             })?
             .get(0);
         match (applied, exists) {
-            (true, true) => verify_table_schema(client, schema, migration).await?,
+            // A table's live shape answers to the newest applied migration that touched it
+            (true, true) => {
+                if newest_applied_for_table(recorded, migration.table) == migration.version {
+                    verify_table_schema(client, schema, migration).await?;
+                }
+            }
             (true, false) => {
                 return Err(StorageError::MigrationSchemaDrift {
                     version: migration.version,
                     table: migration.table,
                 });
             }
-            (false, true) => {
+            // An unapplied migration that only extends an earlier table is not an unledgered table
+            (false, true) if migration.creates_table => {
                 return Err(StorageError::UnledgeredMigrationTable {
                     table: migration.table,
                 });
             }
-            (false, false) => {}
+            (false, _) => {}
         }
     }
     Ok(())
+}
+
+/// Newest applied migration version touching one table, or zero when none is applied.
+fn newest_applied_for_table(recorded: &[Row], table: &str) -> i64 {
+    MIGRATIONS
+        .iter()
+        .filter(|migration| migration.table == table)
+        .filter(|migration| {
+            recorded
+                .iter()
+                .any(|row| row.get::<_, i64>(0) == migration.version)
+        })
+        .map(|migration| migration.version)
+        .max()
+        .unwrap_or_default()
 }
 
 async fn verify_table_schema<C: GenericClient + Sync>(
@@ -661,6 +703,17 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             ("provider_reference", "text", "YES", None),
             ("failure_code", "text", "YES", None),
             ("created_at", "timestamptz", "NO", None),
+        ],
+        10 => vec![
+            ("id", "uuid", "NO", None),
+            ("title", "text", "NO", None),
+            ("project_id", "uuid", "YES", None),
+            ("lifecycle", "text", "NO", None),
+            ("version", "int8", "NO", None),
+            ("created_at", "timestamptz", "NO", None),
+            ("updated_at", "timestamptz", "NO", None),
+            ("completed_at", "timestamptz", "YES", None),
+            ("trashed_at", "timestamptz", "YES", None),
         ],
         _ => unreachable!("known migrations only"),
     };
@@ -773,6 +826,18 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             "CHECK (status <> 'failed'::text OR failure_code IS NOT NULL)",
             "CHECK (status = 'pending'::text OR attempted_at IS NOT NULL)",
             "CHECK (status <> 'pending'::text OR attempted_at IS NULL)",
+        ],
+        10 => vec![
+            "PRIMARY KEY (id)",
+            "FOREIGN KEY (project_id) REFERENCES projects(id)",
+            "CHECK (btrim(title) <> ''::text)",
+            "CHECK (lifecycle = ANY (ARRAY['open'::text, 'completed'::text, 'trashed'::text]))",
+            "CHECK (version >= 1)",
+            "CHECK (updated_at >= created_at)",
+            "CHECK ((lifecycle = 'completed'::text) = (completed_at IS NOT NULL))",
+            "CHECK ((lifecycle = 'trashed'::text) = (trashed_at IS NOT NULL))",
+            "CHECK (completed_at IS NULL OR completed_at >= created_at AND completed_at <= updated_at)",
+            "CHECK (trashed_at IS NULL OR trashed_at >= created_at AND trashed_at <= updated_at)",
         ],
         _ => unreachable!("known migrations only"),
     };
@@ -1209,8 +1274,9 @@ impl PostgresTodoRepository {
             .execute(
                 &format!(
                     "INSERT INTO {todos} \
-                     (id, title, project_id, lifecycle, version, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                     (id, title, project_id, lifecycle, version, created_at, updated_at, \
+                     completed_at, trashed_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
                 ),
                 &[
                     &todo.id().as_uuid(),
@@ -1220,6 +1286,8 @@ impl PostgresTodoRepository {
                     &version,
                     &todo.created_at(),
                     &todo.updated_at(),
+                    &todo.completed_at(),
+                    &todo.trashed_at(),
                 ],
             )
             .await;
@@ -1251,8 +1319,8 @@ impl PostgresTodoRepository {
         let row = client
             .query_opt(
                 &format!(
-                    "SELECT id, title, project_id, lifecycle, version, created_at, updated_at \
-                     FROM {todos} WHERE id = $1"
+                    "SELECT id, title, project_id, lifecycle, version, created_at, updated_at, \
+                     completed_at, trashed_at FROM {todos} WHERE id = $1"
                 ),
                 &[&todo_id.as_uuid()],
             )
@@ -1276,8 +1344,8 @@ impl PostgresTodoRepository {
         let rows = client
             .query(
                 &format!(
-                    "SELECT id, title, project_id, lifecycle, version, created_at, updated_at \
-                     FROM {todos} ORDER BY id"
+                    "SELECT id, title, project_id, lifecycle, version, created_at, updated_at, \
+                     completed_at, trashed_at FROM {todos} ORDER BY id"
                 ),
                 &[],
             )
@@ -1308,8 +1376,8 @@ impl PostgresTodoRepository {
         let row = transaction
             .query_opt(
                 &format!(
-                    "SELECT id, title, project_id, lifecycle, version, created_at, updated_at \
-                     FROM {todos} WHERE id = $1 FOR UPDATE"
+                    "SELECT id, title, project_id, lifecycle, version, created_at, updated_at, \
+                     completed_at, trashed_at FROM {todos} WHERE id = $1 FOR UPDATE"
                 ),
                 &[&replacement.id().as_uuid()],
             )
@@ -1353,7 +1421,8 @@ impl PostgresTodoRepository {
             .execute(
                 &format!(
                     "UPDATE {todos} SET title = $1, project_id = $2, lifecycle = $3, \
-                     version = $4, updated_at = $5 WHERE id = $6 AND version = $7"
+                     version = $4, updated_at = $5, completed_at = $6, trashed_at = $7 \
+                     WHERE id = $8 AND version = $9"
                 ),
                 &[
                     &replacement.title(),
@@ -1361,6 +1430,8 @@ impl PostgresTodoRepository {
                     &lifecycle,
                     &todo_database_version(replacement.version())?,
                     &replacement.updated_at(),
+                    &replacement.completed_at(),
+                    &replacement.trashed_at(),
                     &replacement.id().as_uuid(),
                     &todo_database_version(expected)?,
                 ],
@@ -1591,6 +1662,8 @@ async fn load_todo_relationships<C: GenericClient + Sync>(
         todo.version(),
         todo.created_at(),
         todo.updated_at(),
+        todo.completed_at(),
+        todo.trashed_at(),
     )
     .map_err(StorageError::Domain)
 }
@@ -1646,6 +1719,8 @@ fn revalidate_todo(todo: &Todo) -> Result<(), StorageError> {
         todo.version(),
         todo.created_at(),
         todo.updated_at(),
+        todo.completed_at(),
+        todo.trashed_at(),
     )?;
     Ok(())
 }
@@ -1686,6 +1761,8 @@ fn todo_from_row(row: &Row) -> Result<Todo, StorageError> {
         version,
         row.get::<_, DateTime<Utc>>(5),
         row.get::<_, DateTime<Utc>>(6),
+        row.get::<_, Option<DateTime<Utc>>>(7),
+        row.get::<_, Option<DateTime<Utc>>>(8),
     )
     .map_err(|_| StorageError::InvalidStoredTodoData)
 }
@@ -2018,11 +2095,16 @@ pub async fn export_authority(database_url: &DatabaseUrl) -> Result<AuthorityExp
         })?;
     let todo_rows = transaction
         .query(
-            &format!("SELECT id, title, project_id, lifecycle, version, created_at, updated_at FROM {todos_table} ORDER BY id"),
+            &format!(
+                "SELECT id, title, project_id, lifecycle, version, created_at, updated_at, \
+                 completed_at, trashed_at FROM {todos_table} ORDER BY id"
+            ),
             &[],
         )
         .await
-        .map_err(|_| StorageError::Database { operation: "interop export" })?;
+        .map_err(|_| StorageError::Database {
+            operation: "interop export",
+        })?;
     let state_table = schema.table("mg_todo_authority_state");
     let revision = transaction
         .query_opt(

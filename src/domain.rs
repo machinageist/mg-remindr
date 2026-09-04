@@ -18,6 +18,15 @@ pub enum DomainError {
     InvalidLifecycle,
     #[error("updated_at must not be earlier than created_at")]
     InvalidTimestamps,
+    #[error("{lifecycle} lifecycle requires its transition time")]
+    MissingTransitionTime { lifecycle: &'static str },
+    #[error("{lifecycle} lifecycle must not carry a {field}")]
+    UnexpectedTransitionTime {
+        lifecycle: &'static str,
+        field: &'static str,
+    },
+    #[error("{field} must fall between created_at and updated_at")]
+    TransitionTimeOutsideHistory { field: &'static str },
 }
 macro_rules! id {
     ($name:ident, $kind:literal) => {
@@ -67,6 +76,13 @@ pub enum Lifecycle {
     Trashed,
 }
 impl Lifecycle {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Completed => "completed",
+            Self::Trashed => "trashed",
+        }
+    }
     pub fn transition(self, next: Self) -> Result<Self, DomainError> {
         match (self, next) {
             (Self::Open, Self::Completed | Self::Trashed)
@@ -145,6 +161,8 @@ pub struct Todo {
     version: Version,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
+    trashed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Deserialize)]
@@ -176,6 +194,10 @@ struct TodoWire {
     version: Version,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    #[serde(default)]
+    completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    trashed_at: Option<DateTime<Utc>>,
 }
 impl<'de> Deserialize<'de> for Project {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -212,6 +234,8 @@ impl<'de> Deserialize<'de> for Todo {
             w.version,
             w.created_at,
             w.updated_at,
+            w.completed_at,
+            w.trashed_at,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -304,10 +328,13 @@ impl Todo {
         version: Version,
         created_at: DateTime<Utc>,
         updated_at: DateTime<Utc>,
+        completed_at: Option<DateTime<Utc>>,
+        trashed_at: Option<DateTime<Utc>>,
     ) -> Result<Self, DomainError> {
         if updated_at < created_at {
             return Err(DomainError::InvalidTimestamps);
         }
+        validate_transition_times(lifecycle, completed_at, trashed_at, created_at, updated_at)?;
         Ok(Self {
             id,
             title: valid_text(&title, "todo title")?,
@@ -319,6 +346,8 @@ impl Todo {
             version,
             created_at,
             updated_at,
+            completed_at,
+            trashed_at,
         })
     }
     pub fn title(&self) -> &str {
@@ -351,6 +380,54 @@ impl Todo {
     pub const fn updated_at(&self) -> DateTime<Utc> {
         self.updated_at
     }
+    pub const fn completed_at(&self) -> Option<DateTime<Utc>> {
+        self.completed_at
+    }
+    pub const fn trashed_at(&self) -> Option<DateTime<Utc>> {
+        self.trashed_at
+    }
+}
+
+// A lifecycle carries exactly the transition time it earned, inside the row's own history
+fn validate_transition_times(
+    lifecycle: Lifecycle,
+    completed_at: Option<DateTime<Utc>>,
+    trashed_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+) -> Result<(), DomainError> {
+    let expected = match lifecycle {
+        Lifecycle::Open => (false, false),
+        Lifecycle::Completed => (true, false),
+        Lifecycle::Trashed => (false, true),
+    };
+    for (present, wanted, field) in [
+        (completed_at.is_some(), expected.0, "completed_at"),
+        (trashed_at.is_some(), expected.1, "trashed_at"),
+    ] {
+        match (present, wanted) {
+            (false, true) => {
+                return Err(DomainError::MissingTransitionTime {
+                    lifecycle: lifecycle.label(),
+                });
+            }
+            (true, false) => {
+                return Err(DomainError::UnexpectedTransitionTime {
+                    lifecycle: lifecycle.label(),
+                    field,
+                });
+            }
+            _ => {}
+        }
+    }
+    for (value, field) in [(completed_at, "completed_at"), (trashed_at, "trashed_at")] {
+        if let Some(value) = value
+            && (value < created_at || value > updated_at)
+        {
+            return Err(DomainError::TransitionTimeOutsideHistory { field });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,6 +528,8 @@ mod tests {
                 Version::new(),
                 created_at,
                 earlier,
+                None,
+                None,
             ),
             Err(DomainError::InvalidTimestamps)
         );
@@ -459,5 +538,95 @@ mod tests {
             r#"{{"id":"{id}","title":"todo","project_id":null,"parent_id":null,"tag_ids":[],"dependency_ids":[],"lifecycle":"open","version":1,"created_at":"2026-01-02T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
         );
         assert!(serde_json::from_str::<Todo>(&json).is_err());
+    }
+
+    #[test]
+    fn todo_transition_times_must_match_their_lifecycle() {
+        let created_at: DateTime<Utc> = "2026-01-02T00:00:00Z".parse().unwrap();
+        let updated_at: DateTime<Utc> = "2026-01-03T00:00:00Z".parse().unwrap();
+        let before: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let todo = |lifecycle, completed_at, trashed_at| {
+            Todo::new(
+                TodoId::new(),
+                "todo".to_owned(),
+                None,
+                None,
+                vec![],
+                vec![],
+                lifecycle,
+                Version::new(),
+                created_at,
+                updated_at,
+                completed_at,
+                trashed_at,
+            )
+        };
+        assert!(todo(Lifecycle::Open, None, None).is_ok());
+        assert!(todo(Lifecycle::Completed, Some(updated_at), None).is_ok());
+        assert!(todo(Lifecycle::Trashed, None, Some(updated_at)).is_ok());
+        assert_eq!(
+            todo(Lifecycle::Completed, None, None),
+            Err(DomainError::MissingTransitionTime {
+                lifecycle: "completed"
+            })
+        );
+        assert_eq!(
+            todo(Lifecycle::Trashed, None, None),
+            Err(DomainError::MissingTransitionTime {
+                lifecycle: "trashed"
+            })
+        );
+        assert_eq!(
+            todo(Lifecycle::Open, Some(updated_at), None),
+            Err(DomainError::UnexpectedTransitionTime {
+                lifecycle: "open",
+                field: "completed_at"
+            })
+        );
+        assert_eq!(
+            todo(Lifecycle::Completed, Some(updated_at), Some(updated_at)),
+            Err(DomainError::UnexpectedTransitionTime {
+                lifecycle: "completed",
+                field: "trashed_at"
+            })
+        );
+        assert_eq!(
+            todo(Lifecycle::Completed, Some(before), None),
+            Err(DomainError::TransitionTimeOutsideHistory {
+                field: "completed_at"
+            })
+        );
+        assert_eq!(
+            todo(
+                Lifecycle::Trashed,
+                None,
+                Some(updated_at + chrono::Duration::seconds(1))
+            ),
+            Err(DomainError::TransitionTimeOutsideHistory {
+                field: "trashed_at"
+            })
+        );
+    }
+
+    #[test]
+    fn todo_wire_defaults_keep_open_automation_working_and_reject_lifecycle_loss() {
+        let id = TodoId::new();
+        let open = format!(
+            r#"{{"id":"{id}","title":"todo","project_id":null,"parent_id":null,"tag_ids":[],"dependency_ids":[],"lifecycle":"open","version":1,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
+        );
+        assert!(serde_json::from_str::<Todo>(&open).is_ok());
+        let completed = format!(
+            r#"{{"id":"{id}","title":"todo","project_id":null,"parent_id":null,"tag_ids":[],"dependency_ids":[],"lifecycle":"completed","version":1,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}}"#
+        );
+        assert!(serde_json::from_str::<Todo>(&completed).is_err());
+        let recorded = format!(
+            r#"{{"id":"{id}","title":"todo","project_id":null,"parent_id":null,"tag_ids":[],"dependency_ids":[],"lifecycle":"completed","version":1,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:00:00Z"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Todo>(&recorded)
+                .unwrap()
+                .completed_at(),
+            Some("2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
+        );
     }
 }

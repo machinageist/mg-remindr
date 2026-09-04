@@ -1,7 +1,8 @@
 use mg_todo::storage::{
-    AUTHORITY_REVISION_MIGRATION, FOUNDATION_MIGRATION, MIGRATIONS, TAG_MIGRATION, TODO_MIGRATION,
-    TODO_RECURRENCE_MIGRATION, TODO_RELATIONSHIP_MIGRATION, TODO_REMINDER_DELIVERY_MIGRATION,
-    TODO_REMINDER_MIGRATION, TODO_TAG_MIGRATION,
+    AUTHORITY_REVISION_MIGRATION, FOUNDATION_MIGRATION, MIGRATIONS, TAG_MIGRATION,
+    TODO_LIFECYCLE_TIMES_MIGRATION, TODO_MIGRATION, TODO_RECURRENCE_MIGRATION,
+    TODO_RELATIONSHIP_MIGRATION, TODO_REMINDER_DELIVERY_MIGRATION, TODO_REMINDER_MIGRATION,
+    TODO_TAG_MIGRATION,
 };
 use sha2::{Digest, Sha256};
 
@@ -23,7 +24,7 @@ fn sha256_hex(sql: &str) -> String {
 
 #[test]
 fn foundation_migrations_are_embedded_and_append_only() {
-    assert_eq!(MIGRATIONS.len(), 9);
+    assert_eq!(MIGRATIONS.len(), 10);
     assert_eq!(MIGRATIONS[0].version, 1);
     assert_eq!(MIGRATIONS[0].name, "project_authority");
     assert_eq!(MIGRATIONS[0].sql, FOUNDATION_MIGRATION);
@@ -123,6 +124,36 @@ fn foundation_migrations_are_embedded_and_append_only() {
         MIGRATIONS[8].checksum
     );
     assert!(!TODO_REMINDER_DELIVERY_MIGRATION.contains("DROP "));
+}
+
+#[test]
+fn lifecycle_times_migration_extends_todos_without_inventing_history() {
+    assert_eq!(MIGRATIONS[9].version, 10);
+    assert_eq!(MIGRATIONS[9].name, "todo_lifecycle_times");
+    assert_eq!(MIGRATIONS[9].sql, TODO_LIFECYCLE_TIMES_MIGRATION);
+    assert!(TODO_LIFECYCLE_TIMES_MIGRATION.contains("ALTER TABLE todos"));
+    assert!(TODO_LIFECYCLE_TIMES_MIGRATION.contains("ADD COLUMN completed_at timestamptz"));
+    assert!(TODO_LIFECYCLE_TIMES_MIGRATION.contains("ADD COLUMN trashed_at timestamptz"));
+    assert_eq!(
+        sha256_hex(TODO_LIFECYCLE_TIMES_MIGRATION),
+        MIGRATIONS[9].checksum
+    );
+    assert!(!TODO_LIFECYCLE_TIMES_MIGRATION.contains("DROP "));
+    assert!(!TODO_LIFECYCLE_TIMES_MIGRATION.contains("UPDATE "));
+}
+
+#[test]
+fn only_the_lifecycle_times_migration_extends_a_table_created_earlier() {
+    for migration in MIGRATIONS {
+        let creates = migration
+            .sql
+            .contains(&format!("CREATE TABLE {}", migration.table));
+        assert_eq!(
+            creates, migration.creates_table,
+            "migration {} disagrees about owning {}",
+            migration.version, migration.table
+        );
+    }
 }
 
 #[test]

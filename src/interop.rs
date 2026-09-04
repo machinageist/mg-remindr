@@ -183,7 +183,7 @@ pub async fn export(database_url: &DatabaseUrl) -> Result<Snapshot, StorageError
                 }
             })?,
             observed_at: todo.updated_at(),
-            lifecycle: lifecycle(todo.lifecycle(), None),
+            lifecycle: lifecycle(todo.lifecycle(), todo.trashed_at()),
             payload: todo_payload(&todo),
         });
     }
@@ -243,16 +243,22 @@ fn todo_payload(todo: &crate::domain::Todo) -> serde_json::Value {
         "dependency_ids": todo.dependency_ids(),
         "notes": null,
         "parent_id": todo.parent_id(),
-        "completed_at": null,
-        "trashed_at": null,
+        "completed_at": todo.completed_at(),
+        "trashed_at": todo.trashed_at(),
         "version": todo.version().value(),
         "created_at": todo.created_at(),
         "updated_at": todo.updated_at()
     })
 }
 
+// Every lifecycle is representable once its transition time is stored alongside it
 fn validate_exportable_todo(todo: &crate::domain::Todo) -> Result<(), StorageError> {
-    if !matches!(todo.lifecycle(), crate::domain::Lifecycle::Open) {
+    let recorded = match todo.lifecycle() {
+        crate::domain::Lifecycle::Open => true,
+        crate::domain::Lifecycle::Completed => todo.completed_at().is_some(),
+        crate::domain::Lifecycle::Trashed => todo.trashed_at().is_some(),
+    };
+    if !recorded {
         return Err(StorageError::UnrepresentableAuthority {
             kind: "todo lifecycle",
         });
@@ -299,27 +305,44 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
-    fn non_open_todos_are_rejected_instead_of_downgraded() {
+    fn recorded_lifecycles_export_and_carry_their_transition_time() {
         let timestamp = Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap();
-        let todo = Todo::new(
-            TodoId::new(),
-            "completed work".to_owned(),
-            None,
-            None,
-            Vec::new(),
-            Vec::new(),
-            TodoLifecycle::Completed,
-            Version::new(),
-            timestamp,
-            timestamp,
-        )
-        .unwrap();
-        assert_eq!(
-            validate_exportable_todo(&todo),
-            Err(StorageError::UnrepresentableAuthority {
-                kind: "todo lifecycle"
-            })
-        );
+        let build = |lifecycle, completed_at, trashed_at| {
+            Todo::new(
+                TodoId::new(),
+                "completed work".to_owned(),
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                lifecycle,
+                Version::new(),
+                timestamp,
+                timestamp,
+                completed_at,
+                trashed_at,
+            )
+            .unwrap()
+        };
+
+        let completed = build(TodoLifecycle::Completed, Some(timestamp), None);
+        assert_eq!(validate_exportable_todo(&completed), Ok(()));
+        let payload = todo_payload(&completed);
+        assert_eq!(payload["completed_at"], serde_json::json!(timestamp));
+        assert!(payload["trashed_at"].is_null());
+        let state = lifecycle(completed.lifecycle(), completed.trashed_at());
+        assert_eq!(state.state, "active");
+        assert_eq!(state.trashed_at, None);
+
+        let trashed = build(TodoLifecycle::Trashed, None, Some(timestamp));
+        assert_eq!(validate_exportable_todo(&trashed), Ok(()));
+        let payload = todo_payload(&trashed);
+        assert!(payload["completed_at"].is_null());
+        assert_eq!(payload["trashed_at"], serde_json::json!(timestamp));
+        // mg-calr rejects a snapshot whose record lifecycle and payload disagree
+        let state = lifecycle(trashed.lifecycle(), trashed.trashed_at());
+        assert_eq!(state.state, "trashed");
+        assert_eq!(state.trashed_at, Some(timestamp));
     }
 
     #[test]
@@ -336,6 +359,8 @@ mod tests {
             Version::new(),
             timestamp,
             timestamp,
+            None,
+            None,
         )
         .unwrap();
         let payload = todo_payload(&todo);
