@@ -23,7 +23,7 @@ Baseline: `6733cccac13f6ab6790c54486d4a11739bfbf454`
 9. Add criteria, gates, verdicts, and explicit waivers.
 10. Add scheduling request/receipt records; mg-calr remains the event authority.
 11. Add execution attempts and artifact manifests.
-12. Close the Brief -> Vault -> Plan -> Calr -> Attempt -> Verdict -> Vault retrospective gauntlet.
+12. Close the Brief -> Vault -> Plan -> Calr -> Attempt -> Verdict -> Vault retrospective loop.
 13. Migrate known consumers to the plan-native producer.
 14. Remove compatibility only in a separately approved and verified deletion slice.
 
