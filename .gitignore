@@ -1,3 +1,21 @@
+# Rust build artifacts
 /target/
-*.local.toml
+**/*.rs.bk
+
+# Local environment and credentials
 .env
+.env.*
+!.env.example
+*.local.toml
+
+# Scratch and temporary working files
+.tmp/
+*.tmp
+*.bak
+
+# Editor and OS noise
+*.swp
+*~
+.idea/
+.vscode/
+.DS_Store
