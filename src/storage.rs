@@ -30,7 +30,15 @@ pub const TODO_LIFECYCLE_TIMES_MIGRATION: &str =
 pub const TODO_DUE_MIGRATION: &str = include_str!("../migrations/0011_todo_due.sql");
 pub const TODO_REMINDER_MIGRATION: &str =
     include_str!("../migrations/0008_todo_reminder_authority.sql");
+pub const REMINDR_AUTHORITY_RENAME_MIGRATION: &str =
+    include_str!("../migrations/0012_remindr_authority_rename.sql");
 const LEDGER: &str = "mg_todo_schema_migrations";
+// Migration 12 renames the checkpoint table migration 5 created. Verification runs
+// before pending migrations apply, so a database still at version 11 must be checked
+// against the pre-rename name or it drifts before it can be migrated.
+const CHECKPOINT_MIGRATION: i64 = 5;
+const CHECKPOINT_RENAME_MIGRATION: i64 = 12;
+const CHECKPOINT_TABLE_RENAMED: &str = "mg_remindr_authority_state";
 const MIGRATION_LOCK: i64 = 73_407_463_646;
 
 #[derive(Debug, Clone, Copy)]
@@ -133,6 +141,14 @@ pub const MIGRATIONS: &[Migration] = &[
         table: "todos",
         creates_table: false,
     },
+    Migration {
+        version: 12,
+        name: "remindr_authority_rename",
+        sql: REMINDR_AUTHORITY_RENAME_MIGRATION,
+        checksum: "d668bbe4507dd58be96789b64ea129f6852339eb81ea59c216d7dc3507101473",
+        table: "mg_remindr_authority_state",
+        creates_table: false,
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -157,9 +173,9 @@ pub struct AuthorityExport {
 pub enum StorageError {
     #[error("database configuration is not local-only")]
     InvalidConfiguration,
-    #[error("mg-todo database connection failed")]
+    #[error("mg-remindr database connection failed")]
     Connect,
-    #[error("mg-todo database operation failed during {operation}")]
+    #[error("mg-remindr database operation failed during {operation}")]
     Database { operation: &'static str },
     #[error("migration {version} drift: expected '{expected}', recorded '{actual}'")]
     MigrationDrift {
@@ -502,7 +518,7 @@ pub async fn migrate(database_url: &DatabaseUrl) -> Result<Vec<MigrationState>, 
             .map_err(|_| StorageError::Database {
                 operation: "migration",
             })?;
-        verify_table_schema(&transaction, &schema, migration).await?;
+        verify_table_schema(&transaction, &schema, migration, migration.table).await?;
         let checksum = migration_checksum(migration);
         transaction
             .execute(
@@ -568,7 +584,11 @@ async fn verify_migration_schemas<C: GenericClient + Sync>(
     schema: &AuthoritySchema,
     recorded: &[Row],
 ) -> Result<(), StorageError> {
+    let renamed = recorded
+        .iter()
+        .any(|row| row.get::<_, i64>(0) == CHECKPOINT_RENAME_MIGRATION);
     for migration in MIGRATIONS {
+        let table = live_table(migration, renamed);
         let applied = recorded
             .iter()
             .any(|row| row.get::<_, i64>(0) == migration.version);
@@ -576,7 +596,7 @@ async fn verify_migration_schemas<C: GenericClient + Sync>(
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
                  WHERE table_schema = $1 AND table_name = $2 AND table_type = 'BASE TABLE')",
-                &[&schema.name, &migration.table],
+                &[&schema.name, &table],
             )
             .await
             .map_err(|_| StorageError::Database {
@@ -586,21 +606,19 @@ async fn verify_migration_schemas<C: GenericClient + Sync>(
         match (applied, exists) {
             // A table's live shape answers to the newest applied migration that touched it
             (true, true) => {
-                if newest_applied_for_table(recorded, migration.table) == migration.version {
-                    verify_table_schema(client, schema, migration).await?;
+                if newest_applied_for_table(recorded, table, renamed) == migration.version {
+                    verify_table_schema(client, schema, migration, table).await?;
                 }
             }
             (true, false) => {
                 return Err(StorageError::MigrationSchemaDrift {
                     version: migration.version,
-                    table: migration.table,
+                    table,
                 });
             }
             // An unapplied migration that only extends an earlier table is not an unledgered table
             (false, true) if migration.creates_table => {
-                return Err(StorageError::UnledgeredMigrationTable {
-                    table: migration.table,
-                });
+                return Err(StorageError::UnledgeredMigrationTable { table });
             }
             (false, _) => {}
         }
@@ -608,11 +626,19 @@ async fn verify_migration_schemas<C: GenericClient + Sync>(
     Ok(())
 }
 
+/// The table name a migration answers to right now, following the checkpoint rename.
+fn live_table(migration: &Migration, renamed: bool) -> &'static str {
+    if renamed && migration.version == CHECKPOINT_MIGRATION {
+        return CHECKPOINT_TABLE_RENAMED;
+    }
+    migration.table
+}
+
 /// Newest applied migration version touching one table, or zero when none is applied.
-fn newest_applied_for_table(recorded: &[Row], table: &str) -> i64 {
+fn newest_applied_for_table(recorded: &[Row], table: &str, renamed: bool) -> i64 {
     MIGRATIONS
         .iter()
-        .filter(|migration| migration.table == table)
+        .filter(|migration| live_table(migration, renamed) == table)
         .filter(|migration| {
             recorded
                 .iter()
@@ -627,13 +653,14 @@ async fn verify_table_schema<C: GenericClient + Sync>(
     client: &C,
     schema: &AuthoritySchema,
     migration: &Migration,
+    table: &'static str,
 ) -> Result<(), StorageError> {
     let rows = client
         .query(
             "SELECT column_name, udt_name, is_nullable, column_default \
              FROM information_schema.columns \
              WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
-            &[&schema.name, &migration.table],
+            &[&schema.name, &table],
         )
         .await
         .map_err(|_| StorageError::Database {
@@ -741,6 +768,12 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             ("due_at", "timestamptz", "YES", None),
             ("due_timezone", "text", "YES", None),
         ],
+        // A pure rename: the checkpoint table keeps the shape migration 5 gave it
+        12 => vec![
+            ("singleton", "bool", "NO", Some("true")),
+            ("revision", "int8", "NO", None),
+            ("changed_at", "timestamptz", "NO", None),
+        ],
         _ => unreachable!("known migrations only"),
     };
     if actual
@@ -758,7 +791,7 @@ async fn verify_table_schema<C: GenericClient + Sync>(
     {
         return Err(StorageError::MigrationSchemaDrift {
             version: migration.version,
-            table: migration.table,
+            table,
         });
     }
 
@@ -779,7 +812,7 @@ async fn verify_table_schema<C: GenericClient + Sync>(
     if constraint_rows.iter().any(|row| !row.get::<_, bool>(1)) {
         return Err(StorageError::MigrationSchemaDrift {
             version: migration.version,
-            table: migration.table,
+            table,
         });
     }
     let constraints = constraint_rows
@@ -879,6 +912,12 @@ async fn verify_table_schema<C: GenericClient + Sync>(
             "CHECK (due_date IS NULL AND due_at IS NULL AND due_timezone IS NULL OR due_timezone IS NOT NULL AND (due_date IS NULL) <> (due_at IS NULL))",
             "CHECK (due_timezone IS NULL OR btrim(due_timezone) <> ''::text)",
         ],
+        // A pure rename: the checkpoint table keeps the constraints migration 5 gave it
+        12 => vec![
+            "PRIMARY KEY (singleton)",
+            "CHECK (singleton)",
+            "CHECK (revision >= 1)",
+        ],
         _ => unreachable!("known migrations only"),
     };
     let mut constraints = constraints;
@@ -888,7 +927,7 @@ async fn verify_table_schema<C: GenericClient + Sync>(
     if constraints != required {
         return Err(StorageError::MigrationSchemaDrift {
             version: migration.version,
-            table: migration.table,
+            table,
         });
     }
     Ok(())
@@ -2210,7 +2249,7 @@ pub async fn export_authority(database_url: &DatabaseUrl) -> Result<AuthorityExp
         .map_err(|_| StorageError::Database {
             operation: "interop export",
         })?;
-    let state_table = schema.table("mg_todo_authority_state");
+    let state_table = schema.table("mg_remindr_authority_state");
     let revision = transaction
         .query_opt(
             &format!("SELECT revision FROM {state_table} WHERE singleton = true"),
@@ -2258,7 +2297,7 @@ mod tests {
     #[test]
     fn storage_errors_do_not_echo_driver_or_connection_material() {
         let error = StorageError::Connect;
-        assert_eq!(error.to_string(), "mg-todo database connection failed");
+        assert_eq!(error.to_string(), "mg-remindr database connection failed");
         assert!(!format!("{error:?}").contains("postgres://"));
     }
 

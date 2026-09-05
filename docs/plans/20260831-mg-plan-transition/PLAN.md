@@ -5,7 +5,7 @@ Baseline: `6733cccac13f6ab6790c54486d4a11739bfbf454`
 ## Locked decisions
 
 - Evolve this repository in place into `mg-plan`.
-- Preserve `mg-todo` as a compatibility CLI and projection producer during migration.
+- Preserve `mg-remindr` as a compatibility CLI and projection producer during migration.
 - `mg-plan` owns projects/work; `mg-calr` owns time.
 - No cross-database reads or writes.
 - No automatic remediation or AI-authorized transition.
@@ -14,7 +14,7 @@ Baseline: `6733cccac13f6ab6790c54486d4a11739bfbf454`
 
 1. Document product and migration authority. Status: in progress.
 2. Add a monotonic PostgreSQL authority revision/checkpoint covering every project, tag, and todo mutation.
-3. Export the current mg-todo authority as one deterministic immutable snapshot.
+3. Export the current mg-remindr authority as one deterministic immutable snapshot.
 4. Prove mg-calr validates faithfully representable producer fixtures and rejects lifecycle-loss fixtures without direct database access.
 5. Add append-only lifecycle fidelity and update the consumer contract without inventing historical transition timestamps.
 6. Add a plan-native compatibility facade while preserving durable IDs.
@@ -29,7 +29,7 @@ Baseline: `6733cccac13f6ab6790c54486d4a11739bfbf454`
 
 ## Immediate corrective slice: monotonic authority revision
 
-Add one append-only migration and behavior tests establishing a durable positive revision/checkpoint for the complete mg-todo authority. It must advance atomically with successful project, tag, and todo changes, remain unchanged after validation/database rollback, survive restart, reject drift, and be readable in the same transaction later used by snapshot export. Do not derive it from record counts, maximum per-row versions, wall-clock export time, or a truncated content digest.
+Add one append-only migration and behavior tests establishing a durable positive revision/checkpoint for the complete mg-remindr authority. It must advance atomically with successful project, tag, and todo changes, remain unchanged after validation/database rollback, survive restart, reject drift, and be readable in the same transaction later used by snapshot export. Do not derive it from record counts, maximum per-row versions, wall-clock export time, or a truncated content digest.
 
 ## Following slice: deterministic compatibility export
 
@@ -42,7 +42,7 @@ Likely files:
 - `tests/interop_contract.rs`: deterministic, malformed/stale/schema, and CLI boundary tests.
 - PostgreSQL integration test: prove one-transaction acquisition and round trip.
 
-The compatibility payload may supply only schema-defined neutral defaults for fields that `mg-todo` does not own (for example no due value or reminders). It must not manufacture completion/trash timestamps from `updated_at`. Any authoritative row that cannot be represented faithfully makes the snapshot explicitly incomplete.
+The compatibility payload may supply only schema-defined neutral defaults for fields that `mg-remindr` does not own (for example no due value or reminders). It must not manufacture completion/trash timestamps from `updated_at`. Any authoritative row that cannot be represented faithfully makes the snapshot explicitly incomplete.
 
 Verification:
 

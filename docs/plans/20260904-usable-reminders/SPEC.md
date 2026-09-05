@@ -4,7 +4,7 @@ Status: slices 1-4 delivered and verified end to end against the local authority
 
 ## Desired outcome
 
-A person can keep reminders in `mg-todo` and see the dated ones on the `mg-calr`
+A person can keep reminders in `mg-remindr` and see the dated ones on the `mg-calr`
 agenda, using the shipped CLIs and nothing else. Today none of that is possible,
 for reasons proven against a live local PostgreSQL authority on 2026-09-04.
 
@@ -16,11 +16,11 @@ walking the documented end-to-end path against `mg_todo` and `mg_calr`:
 - `mg-calr` is operable. Migrations apply, calendars and events are created from
   flags, the day agenda renders, and `interop import-todo` validates and stores a
   producer snapshot crash-safely.
-- `mg-todo` migrations now apply and `interop export` produces a snapshot that
+- `mg-remindr` migrations now apply and `interop export` produces a snapshot that
   `mg-calr` accepts.
 - `Todo` has no due value. `todo_payload` hardcodes `due`, `recurrence`,
   `reminders`, `priority`, and `notes` to empty. `mg-calr`'s `agenda_due_instances`
-  returns nothing for a todo without a due value, so no `mg-todo` record can ever
+  returns nothing for a todo without a due value, so no `mg-remindr` record can ever
   appear on a day agenda.
 - `validate_exportable_todo` refuses any todo that is not `Open`. Completing or
   trashing one todo makes every later export fail, so the calendar projection can
@@ -68,7 +68,7 @@ without weakening the local-only boundary.
    restores it.
 4. A person can add, list, and complete a reminder without writing JSON, a UUID,
    a version, or a timestamp.
-5. A fresh shell with no `MG_TODO_DATABASE_URL` reaches the local authority; a
+5. A fresh shell with no `MG_REMINDR_DATABASE_URL` reaches the local authority; a
    non-loopback URL is still rejected.
 6. Focused tests, all targets, strict Clippy, formatting, and diff hygiene pass,
    with the disposable-PostgreSQL suite enabled.
@@ -77,7 +77,7 @@ without weakening the local-only boundary.
 
 All four slices are implemented, and the acceptance criteria were walked against
 the live `mg_todo` and `mg_calr` databases through the suite's own
-`geist-sync-todo-projection` bridge: a reminder added with `mg-todo add` appears on
+`geist-sync-todo-projection` bridge: a reminder added with `mg-remindr add` appears on
 `mg-calr agenda` for its day in the requested zone, and completing it removes it.
 
 `mg-calr`'s agenda rendering was repaired alongside, in that repository.

@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand};
-use mg_todo::{
+use mg_remindr::{
     config::{Config, DatabaseUrl},
     domain::{Lifecycle, Project, ProjectId, Tag, TagId, Todo, TodoId, Version},
     human,
@@ -13,13 +13,13 @@ use std::{process::ExitCode, str::FromStr};
 use thiserror::Error;
 
 #[derive(Debug, Parser)]
-#[command(name = "mg-todo", about = "Local PostgreSQL todo authority")]
+#[command(name = "mg-remindr", about = "Local PostgreSQL todo authority")]
 struct Cli {
-    /// Local PostgreSQL URL; defaults to `MG_TODO_DATABASE_URL` or config.toml
+    /// Local PostgreSQL URL; defaults to `MG_REMINDR_DATABASE_URL` or config.toml
     #[arg(
         long,
         global = true,
-        env = "MG_TODO_DATABASE_URL",
+        env = "MG_REMINDR_DATABASE_URL",
         hide_env_values = true
     )]
     database_url: Option<String>,
@@ -97,7 +97,7 @@ struct HandleInput {
 
 #[derive(Debug, Subcommand)]
 enum InteropCommand {
-    /// Export a complete validated mg-todo snapshot
+    /// Export a complete validated mg-remindr snapshot
     Export,
 }
 
@@ -180,7 +180,7 @@ enum CliError {
     #[error("{kind} {id} was not found")]
     NotFound { kind: &'static str, id: String },
     #[error(transparent)]
-    Storage(#[from] mg_todo::storage::StorageError),
+    Storage(#[from] mg_remindr::storage::StorageError),
     #[error("output serialization failed")]
     Output,
     #[error("runtime initialization failed")]
@@ -195,13 +195,13 @@ fn main() -> ExitCode {
         .enable_all()
         .build()
     else {
-        eprintln!("mg-todo: {}", CliError::Runtime);
+        eprintln!("mg-remindr: {}", CliError::Runtime);
         return ExitCode::FAILURE;
     };
     match runtime.block_on(run(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("mg-todo: {error}");
+            eprintln!("mg-remindr: {error}");
             ExitCode::FAILURE
         }
     }
@@ -224,7 +224,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             run_todo(PostgresTodoRepository::new(database_url), command).await
         }
         Command::Interop { command } => match command {
-            InteropCommand::Export => print_json(&mg_todo::interop::export(&database_url).await?),
+            InteropCommand::Export => {
+                print_json(&mg_remindr::interop::export(&database_url).await?)
+            }
         },
         Command::Add(input) => add(PostgresTodoRepository::new(database_url), input).await,
         Command::Ls(input) => list(PostgresTodoRepository::new(database_url), input).await,
@@ -313,8 +315,8 @@ async fn list(repository: PostgresTodoRepository, input: ListInput) -> Result<()
 fn due_key(todo: &Todo) -> String {
     match todo.due() {
         None => String::new(),
-        Some(mg_todo::domain::TodoDue::Date { date, .. }) => format!("{date}T00:00"),
-        Some(mg_todo::domain::TodoDue::Timed { at, .. }) => at.to_rfc3339(),
+        Some(mg_remindr::domain::TodoDue::Date { date, .. }) => format!("{date}T00:00"),
+        Some(mg_remindr::domain::TodoDue::Timed { at, .. }) => at.to_rfc3339(),
     }
 }
 

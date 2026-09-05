@@ -1,5 +1,5 @@
 use chrono::{DateTime, NaiveDate, Utc};
-use mg_todo::{
+use mg_remindr::{
     domain::{Lifecycle, Todo, TodoDue, TodoId, Version},
     human::{
         HumanError, close, handle, new_todo, parse_due, render, reopen, resolve_handle,

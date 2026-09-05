@@ -1,16 +1,16 @@
 [package]
-name = "mg-todo"
+name = "mg-remindr"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Bootstrap for a planned local-first todo authority"
 
 [lib]
-name = "mg_todo"
+name = "mg_remindr"
 path = "src/lib.rs"
 
 [[bin]]
-name = "mg-todo"
+name = "mg-remindr"
 path = "src/main.rs"
 
 [dependencies]

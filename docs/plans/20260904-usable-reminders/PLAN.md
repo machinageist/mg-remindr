@@ -24,7 +24,7 @@ Baseline: `5cc516b`
   `Completed` and `Trashed` through the existing `lifecycle` helper, and emit both
   timestamps in the payload.
 
-Verification: `cargo test --all-targets` with `MG_TODO_ALLOW_INTEGRATION_TESTS=1`,
+Verification: `cargo test --all-targets` with `MG_REMINDR_ALLOW_INTEGRATION_TESTS=1`,
 then a live round trip proving a completed todo exports and imports.
 
 ## Slice 2: due values

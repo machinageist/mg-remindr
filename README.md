@@ -1,6 +1,6 @@
-# mg-todo
+# mg-remindr
 
-`mg-todo` is the local PostgreSQL todo authority for the Geist suite. It owns
+`mg-remindr` is the local PostgreSQL todo authority for the Geist suite. It owns
 todos, projects, tags, relationships, lifecycle, versions, and the recorded
 transition times behind them, and produces the immutable projection `mg-calr`
 reads for its agenda. Recurrence and reminder delivery have persistence but are
@@ -9,12 +9,12 @@ not yet part of the todo aggregate or its export.
 ## Keeping reminders
 
 ```text
-mg-todo add "Pay rent" --due today
-mg-todo add "Dentist" --due 2026-09-08T14:00
-mg-todo ls
-mg-todo done <handle>
-mg-todo rm <handle>
-mg-todo restore <handle>
+mg-remindr add "Pay rent" --due today
+mg-remindr add "Dentist" --due 2026-09-08T14:00
+mg-remindr ls
+mg-remindr done <handle>
+mg-remindr rm <handle>
+mg-remindr restore <handle>
 ```
 
 `--due` accepts `today`, `tomorrow`, `YYYY-MM-DD`, or `YYYY-MM-DDTHH:MM`.
@@ -33,11 +33,11 @@ trailing or leading part of one.
 ## Automation surface
 
 ```text
-mg-todo migration status|apply
-mg-todo project create|find|list|replace
-mg-todo tag create|find|list|replace
-mg-todo todo create|find|list|replace
-mg-todo interop export
+mg-remindr migration status|apply
+mg-remindr project create|find|list|replace
+mg-remindr tag create|find|list|replace
+mg-remindr todo create|find|list|replace
+mg-remindr interop export
 ```
 
 Create and replace accept complete validated domain objects through `--json`;
@@ -53,7 +53,7 @@ single repeatable-read transaction, carrying the monotonic authority revision.
 `mg-calr` never opens this database. Refresh its agenda projection explicitly:
 
 ```text
-mg-todo interop export > snapshot.json
+mg-remindr interop export > snapshot.json
 mg-calr interop import-todo --input snapshot.json \
   --store ~/.local/share/mg-calr/todo-projection.json
 mg-calr agenda --start 2026-09-04 --end 2026-09-05 --timezone America/New_York
@@ -72,11 +72,11 @@ provisioned:
 ```bash
 sudo -u postgres createuser --login "$USER"
 sudo -u postgres createdb --owner "$USER" mg_todo
-mg-todo migration apply  # run unprivileged, not through sudo
+mg-remindr migration apply  # run unprivileged, not through sudo
 ```
 
-`--database-url`, then `MG_TODO_DATABASE_URL`, then
-`$XDG_CONFIG_HOME/mg-todo/config.toml` override that default. A remote host is
+`--database-url`, then `MG_REMINDR_DATABASE_URL`, then
+`$XDG_CONFIG_HOME/mg-remindr/config.toml` override that default. A remote host is
 rejected before any connection is attempted.
 
 ## Development
@@ -84,11 +84,11 @@ rejected before any connection is attempted.
 ```bash
 cargo fmt --all -- --check
 TMPDIR=/dev/shm cargo clippy --all-targets --all-features -- -D warnings
-MG_TODO_ALLOW_INTEGRATION_TESTS=1 TMPDIR=/dev/shm cargo test --all-targets
+MG_REMINDR_ALLOW_INTEGRATION_TESTS=1 TMPDIR=/dev/shm cargo test --all-targets
 git diff --check
 ```
 
-The disposable-PostgreSQL suite is opt-in through `MG_TODO_ALLOW_INTEGRATION_TESTS=1`
+The disposable-PostgreSQL suite is opt-in through `MG_REMINDR_ALLOW_INTEGRATION_TESTS=1`
 and starts its own server; leaving it off hides migration and schema regressions.
 
 ## Deferred

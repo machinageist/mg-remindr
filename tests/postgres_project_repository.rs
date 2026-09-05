@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Utc};
-use mg_todo::{
+use mg_remindr::{
     config::{Config, DatabaseUrl},
     domain::{Lifecycle, Project, ProjectId, Version},
     storage::{PostgresProjectRepository, StorageError, migrate, migration_status},

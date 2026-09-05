@@ -4,9 +4,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, ser::SerializeStru
 use thiserror::Error;
 use url::Url;
 
-const APP: &str = "mg-todo";
-const DB_ENV: &str = "MG_TODO_DATABASE_URL";
-const TEST_ENV: &str = "MG_TODO_ALLOW_INTEGRATION_TESTS";
+const APP: &str = "mg-remindr";
+const DB_ENV: &str = "MG_REMINDR_DATABASE_URL";
+const TEST_ENV: &str = "MG_REMINDR_ALLOW_INTEGRATION_TESTS";
 // The unconfigured authority is the local peer-authenticated socket, the same shape mg-calr uses
 const DEFAULT_DATABASE: &str = "mg_todo";
 const DEFAULT_SOCKET_DIR: &str = "/run/postgresql";
@@ -118,7 +118,7 @@ impl Config {
 pub struct RedactedDatabaseError;
 impl fmt::Display for RedactedDatabaseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("mg-todo database operation failed")
+        f.write_str("mg-remindr database operation failed")
     }
 }
 impl std::error::Error for RedactedDatabaseError {}

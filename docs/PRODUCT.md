@@ -6,7 +6,7 @@ Status: accepted suite direction; implementation is incremental.
 
 `mg-plan` turns cited understanding into explicit commitments and proves whether those commitments were fulfilled. It is the suite's workflow center, not its technical hub, execution engine, calendar, knowledge store, repository mirror, or artifact warehouse.
 
-The existing `mg-todo` authority in this repository evolves in place into `mg-plan`. Existing durable IDs and PostgreSQL history remain valid. The `mg-todo` binary and `mg-todo` projection contract remain compatibility surfaces until a separately verified cutover removes them.
+The existing `mg-remindr` authority in this repository evolves in place into `mg-plan`. Existing durable IDs and PostgreSQL history remain valid. The `mg-remindr` binary and `mg-remindr` projection contract remain compatibility surfaces until a separately verified cutover removes them.
 
 ## Suite authorities
 
@@ -70,7 +70,7 @@ Outgoing link assertions are owned by the asserting application; backlinks are r
 
 - Preserve every existing project/todo/tag identifier and committed migration.
 - Append migrations; never rewrite applied migration SQL or history.
-- Keep the current `mg-todo` producer and CLI readable during compatibility phases.
+- Keep the current `mg-remindr` producer and CLI readable during compatibility phases.
 - Add plan-native APIs before changing consumers.
 - Export both compatibility and plan-native projections during cutover when necessary; never reuse one producer/revision identity for different bytes.
 - Prevalidate migrations, reject overwrite/conflict, verify round trips, and retain rollback evidence.

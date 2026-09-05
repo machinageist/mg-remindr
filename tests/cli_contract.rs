@@ -3,7 +3,7 @@ use predicates::prelude::*;
 
 #[test]
 fn help_exposes_persistence_workflows_without_database_configuration() {
-    cargo_bin_cmd!("mg-todo")
+    cargo_bin_cmd!("mg-remindr")
         .arg("--help")
         .assert()
         .success()
@@ -17,7 +17,7 @@ fn help_exposes_persistence_workflows_without_database_configuration() {
         .stdout(predicate::str::contains("rm"))
         .stdout(predicate::str::contains("restore"));
 
-    cargo_bin_cmd!("mg-todo")
+    cargo_bin_cmd!("mg-remindr")
         .args(["project", "--help"])
         .assert()
         .success()
@@ -26,7 +26,7 @@ fn help_exposes_persistence_workflows_without_database_configuration() {
         .stdout(predicate::str::contains("list"))
         .stdout(predicate::str::contains("replace"));
 
-    cargo_bin_cmd!("mg-todo")
+    cargo_bin_cmd!("mg-remindr")
         .args(["todo", "--help"])
         .assert()
         .success()
@@ -38,7 +38,7 @@ fn help_exposes_persistence_workflows_without_database_configuration() {
 
 #[test]
 fn unknown_and_invalid_commands_fail_with_stable_clap_errors() {
-    cargo_bin_cmd!("mg-todo")
+    cargo_bin_cmd!("mg-remindr")
         .arg("unknown")
         .assert()
         .failure()
@@ -46,32 +46,35 @@ fn unknown_and_invalid_commands_fail_with_stable_clap_errors() {
             "unrecognized subcommand 'unknown'",
         ));
 
-    cargo_bin_cmd!("mg-todo")
+    cargo_bin_cmd!("mg-remindr")
         .args(["project", "find", "not-a-uuid"])
-        .env("MG_TODO_DATABASE_URL", "postgres://localhost/mg_todo")
+        .env("MG_REMINDR_DATABASE_URL", "postgres://localhost/mg_todo")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "mg-todo: invalid project identifier",
+            "mg-remindr: invalid project identifier",
         ));
 }
 
 #[test]
 fn a_remote_database_url_is_refused_before_any_connection() {
-    cargo_bin_cmd!("mg-todo")
+    cargo_bin_cmd!("mg-remindr")
         .args(["migration", "status"])
-        .env("MG_TODO_DATABASE_URL", "postgres://db.example.com/mg_todo")
-        .env("XDG_CONFIG_HOME", "/nonexistent/mg-todo-test-config")
+        .env(
+            "MG_REMINDR_DATABASE_URL",
+            "postgres://db.example.com/mg_todo",
+        )
+        .env("XDG_CONFIG_HOME", "/nonexistent/mg-remindr-test-config")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "mg-todo: invalid database configuration",
+            "mg-remindr: invalid database configuration",
         ));
 }
 
 #[test]
 fn the_human_surface_needs_no_json_uuid_version_or_timestamp() {
-    cargo_bin_cmd!("mg-todo")
+    cargo_bin_cmd!("mg-remindr")
         .args(["add", "--help"])
         .assert()
         .success()
@@ -81,7 +84,7 @@ fn the_human_surface_needs_no_json_uuid_version_or_timestamp() {
         .stdout(predicate::str::contains("--json"));
 
     for command in ["add", "ls", "done", "rm", "restore"] {
-        let help = cargo_bin_cmd!("mg-todo")
+        let help = cargo_bin_cmd!("mg-remindr")
             .args([command, "--help"])
             .assert()
             .success();
@@ -95,17 +98,17 @@ fn the_human_surface_needs_no_json_uuid_version_or_timestamp() {
 
 #[test]
 fn an_unreadable_due_value_fails_before_touching_the_database() {
-    cargo_bin_cmd!("mg-todo")
+    cargo_bin_cmd!("mg-remindr")
         .args(["add", "Nope", "--due", "next thursday"])
         .env(
-            "MG_TODO_DATABASE_URL",
+            "MG_REMINDR_DATABASE_URL",
             "postgres://localhost/mg_todo_absent",
         )
         .assert()
         .failure()
-        .stderr(predicate::str::contains("mg-todo: due must be today"));
+        .stderr(predicate::str::contains("mg-remindr: due must be today"));
 
-    cargo_bin_cmd!("mg-todo")
+    cargo_bin_cmd!("mg-remindr")
         .args([
             "add",
             "Nope",
@@ -115,12 +118,12 @@ fn an_unreadable_due_value_fails_before_touching_the_database() {
             "Mars/Olympus",
         ])
         .env(
-            "MG_TODO_DATABASE_URL",
+            "MG_REMINDR_DATABASE_URL",
             "postgres://localhost/mg_todo_absent",
         )
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "mg-todo: timezone is not a named IANA zone",
+            "mg-remindr: timezone is not a named IANA zone",
         ));
 }

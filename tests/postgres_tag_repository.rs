@@ -1,5 +1,5 @@
 use chrono::{TimeZone, Timelike, Utc};
-use mg_todo::{
+use mg_remindr::{
     config::{Config, DatabaseUrl},
     domain::{Tag, TagId, Version},
     storage::{
@@ -712,9 +712,9 @@ async fn weakened_recorded_constraints_fail_closed_without_ledger_mutation() {
 }
 
 fn run_cli(database: &DisposablePostgres, arguments: &[&str]) -> serde_json::Value {
-    let output = Command::new(env!("CARGO_BIN_EXE_mg-todo"))
+    let output = Command::new(env!("CARGO_BIN_EXE_mg-remindr"))
         .args(arguments)
-        .env("MG_TODO_DATABASE_URL", &database.raw_url)
+        .env("MG_REMINDR_DATABASE_URL", &database.raw_url)
         .output()
         .unwrap();
     assert!(

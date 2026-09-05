@@ -5,7 +5,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const SCHEMA: &str = "mg.interop/1";
-const APP: &str = "mg-todo";
+const APP: &str = "mg-remindr";
 
 #[derive(Debug, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -288,7 +288,7 @@ fn link(source: &str, target: &str, relation: &str) -> Link {
         relation: relation.into(),
         created_by: APP.into(),
         created_at: None,
-        provenance: "mg-todo authoritative relationship".into(),
+        provenance: "mg-remindr authoritative relationship".into(),
     }
 }
 fn digest(bytes: &[u8]) -> String {
