@@ -46,9 +46,9 @@ The compatibility payload may supply only schema-defined neutral defaults for fi
 
 Verification:
 
-- `TMPDIR=/home/mgeist/.tmp-hermes cargo test --test interop_contract`
-- `TMPDIR=/home/mgeist/.tmp-hermes cargo test --all-targets`
-- `TMPDIR=/home/mgeist/.tmp-hermes cargo clippy --all-targets -- -D warnings`
+- `TMPDIR=/dev/shm cargo test --test interop_contract`
+- `TMPDIR=/dev/shm cargo test --all-targets`
+- `TMPDIR=/dev/shm cargo clippy --all-targets -- -D warnings`
 - `cargo fmt --check`
 - `git diff --check`
 - fresh independent blind review against the exact baseline and diff
