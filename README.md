@@ -96,3 +96,7 @@ and starts its own server; leaving it off hides migration and schema regressions
 Recurrence and reminders in the todo aggregate and its export, reminder delivery,
 plan-native vocabulary, interop import, migration cutover, and compatibility
 adapter removal.
+
+## License
+
+MIT. See `LICENSE`.
