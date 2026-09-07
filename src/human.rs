@@ -22,6 +22,8 @@ pub enum HumanError {
     Ambiguous(String, Vec<String>),
     AlreadyClosed(&'static str),
     AlreadyOpen,
+    NothingToChange,
+    ConflictingDue,
     Domain(DomainError),
 }
 
@@ -43,6 +45,10 @@ impl fmt::Display for HumanError {
                 matches.join(", ")
             ),
             Self::AlreadyClosed(lifecycle) => write!(formatter, "todo is already {lifecycle}"),
+            Self::NothingToChange => formatter.write_str("nothing to change"),
+            Self::ConflictingDue => {
+                formatter.write_str("--due and --clear-due ask for opposite things")
+            }
             Self::AlreadyOpen => formatter.write_str("todo is already open"),
             Self::Domain(error) => error.fmt(formatter),
         }
@@ -215,6 +221,67 @@ pub fn close(current: &Todo, lifecycle: Lifecycle, at: DateTime<Utc>) -> Result<
         current.due().cloned(),
     )
     .map_err(HumanError::Domain)
+}
+
+/// Build the replacement that changes one open todo's title and/or due value.
+///
+/// `due` distinguishes three intentions a caller can have, which one Option
+/// cannot: leave it alone, clear it, or set it. Only an open todo is amended —
+/// editing something completed or trashed would rewrite settled history.
+///
+/// # Errors
+/// Returns an error when the todo is closed, the title is empty, nothing was
+/// asked for, or the version cannot advance.
+pub fn amend(
+    current: &Todo,
+    title: Option<String>,
+    due: DueChange,
+    at: DateTime<Utc>,
+) -> Result<Todo, HumanError> {
+    if current.lifecycle() != Lifecycle::Open {
+        return Err(HumanError::AlreadyClosed(current.lifecycle().label()));
+    }
+    let wanted = match title {
+        Some(value) => value.trim().to_owned(),
+        None => current.title().to_owned(),
+    };
+    if matches!(due, DueChange::Keep) && wanted == current.title() {
+        return Err(HumanError::NothingToChange);
+    }
+    let due = match due {
+        DueChange::Keep => current.due().cloned(),
+        DueChange::Clear => None,
+        DueChange::Set(value) => Some(value),
+    };
+    // A backward clock must not move the row outside its own history
+    let at = at.max(current.updated_at());
+    Todo::new(
+        current.id(),
+        wanted,
+        current.project_id(),
+        current.parent_id(),
+        current.tag_ids().to_vec(),
+        current.dependency_ids().to_vec(),
+        current.lifecycle(),
+        current.version().next().map_err(HumanError::Domain)?,
+        current.created_at(),
+        at,
+        current.completed_at(),
+        current.trashed_at(),
+        due,
+    )
+    .map_err(HumanError::Domain)
+}
+
+/// What an amendment does to a due value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DueChange {
+    /// Leave whatever is there
+    Keep,
+    /// Remove the due value entirely
+    Clear,
+    /// Replace it
+    Set(TodoDue),
 }
 
 /// Build the replacement that returns one closed todo to the open lifecycle.

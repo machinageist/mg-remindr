@@ -53,6 +53,8 @@ enum Command {
     Add(AddInput),
     /// List reminders, open ones by default
     Ls(ListInput),
+    /// Change one reminder's title and/or due value
+    Edit(EditInput),
     /// Complete one reminder by ID or unambiguous prefix
     Done(HandleInput),
     /// Trash one reminder by ID or unambiguous prefix
@@ -82,6 +84,27 @@ struct ListInput {
     #[arg(long)]
     all: bool,
     /// Emit stored domain objects as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct EditInput {
+    /// The listed handle, or any unambiguous part of an identifier
+    handle: String,
+    /// Replace what the reminder is
+    #[arg(long)]
+    title: Option<String>,
+    /// today, tomorrow, YYYY-MM-DD, or YYYY-MM-DDTHH:MM
+    #[arg(long)]
+    due: Option<String>,
+    /// Remove the due value; refused together with --due
+    #[arg(long)]
+    clear_due: bool,
+    /// IANA zone the due value is written in; defaults to the system zone
+    #[arg(long)]
+    timezone: Option<String>,
+    /// Emit the stored domain object as JSON
     #[arg(long)]
     json: bool,
 }
@@ -230,6 +253,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         },
         Command::Add(input) => add(PostgresTodoRepository::new(database_url), input).await,
         Command::Ls(input) => list(PostgresTodoRepository::new(database_url), input).await,
+        Command::Edit(input) => edit(PostgresTodoRepository::new(database_url), input).await,
         Command::Done(input) => {
             close(
                 PostgresTodoRepository::new(database_url),
@@ -289,6 +313,31 @@ async fn add(repository: PostgresTodoRepository, input: AddInput) -> Result<(), 
         return print_json(&todo);
     }
     println!("{}", human::render(&todo));
+    Ok(())
+}
+
+async fn edit(repository: PostgresTodoRepository, input: EditInput) -> Result<(), CliError> {
+    if input.due.is_some() && input.clear_due {
+        return Err(CliError::Human(human::HumanError::ConflictingDue));
+    }
+    let todos = repository.list().await?;
+    let current = resolve(&todos, &input.handle)?;
+    let due = match (input.due, input.clear_due) {
+        (Some(value), _) => {
+            let at = human::now();
+            let zone = human::resolve_zone(input.timezone.as_deref())?;
+            let today = human::today_in(&zone, at)?;
+            human::DueChange::Set(human::parse_due(&value, &zone, today)?)
+        }
+        (None, true) => human::DueChange::Clear,
+        (None, false) => human::DueChange::Keep,
+    };
+    let replacement = human::amend(current, input.title, due, human::now())?;
+    repository.replace(current.version(), &replacement).await?;
+    if input.json {
+        return print_json(&replacement);
+    }
+    println!("{}", human::render(&replacement));
     Ok(())
 }
 

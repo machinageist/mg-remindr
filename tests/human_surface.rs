@@ -2,8 +2,8 @@ use chrono::{DateTime, NaiveDate, Utc};
 use mg_remindr::{
     domain::{Lifecycle, Todo, TodoDue, TodoId, Version},
     human::{
-        HumanError, close, handle, new_todo, parse_due, render, reopen, resolve_handle,
-        resolve_zone,
+        DueChange, HumanError, amend, close, handle, new_todo, parse_due, render, reopen,
+        resolve_handle, resolve_zone,
     },
 };
 
@@ -126,6 +126,66 @@ fn a_handle_names_one_todo_or_refuses_to_guess() {
         resolve_handle(&todos, shared),
         Err(HumanError::Ambiguous(_, matches)) if matches.len() == 2
     ));
+}
+
+#[test]
+fn amending_changes_only_what_was_asked_for_and_advances_the_version() {
+    let due = TodoDue::date(today(), "US/Pacific".to_owned()).unwrap();
+    let open = todo("pay rent", Some(due.clone()));
+    let at = instant("2026-09-05T09:00:00Z");
+
+    // A title alone leaves the due value where it was
+    let retitled = amend(&open, Some("pay the rent".to_owned()), DueChange::Keep, at).unwrap();
+    assert_eq!(retitled.title(), "pay the rent");
+    assert_eq!(retitled.due(), Some(&due));
+    assert_eq!(retitled.version(), Version::try_from_value(2).unwrap());
+    assert_eq!(retitled.created_at(), open.created_at());
+    assert_eq!(retitled.lifecycle(), Lifecycle::Open);
+
+    // Clearing is distinct from leaving alone, which one Option cannot express
+    let cleared = amend(&open, None, DueChange::Clear, at).unwrap();
+    assert_eq!(cleared.title(), "pay rent");
+    assert_eq!(cleared.due(), None);
+
+    let moved = TodoDue::date(
+        NaiveDate::from_ymd_opt(2026, 9, 20).unwrap(),
+        "US/Pacific".to_owned(),
+    )
+    .unwrap();
+    let rescheduled = amend(&open, None, DueChange::Set(moved.clone()), at).unwrap();
+    assert_eq!(rescheduled.due(), Some(&moved));
+    assert_eq!(rescheduled.title(), "pay rent");
+}
+
+#[test]
+fn amending_refuses_a_no_op_and_anything_already_closed() {
+    let open = todo("pay rent", None);
+    let at = instant("2026-09-05T09:00:00Z");
+
+    assert_eq!(
+        amend(&open, Some("pay rent".to_owned()), DueChange::Keep, at),
+        Err(HumanError::NothingToChange)
+    );
+    assert_eq!(
+        amend(&open, None, DueChange::Keep, at),
+        Err(HumanError::NothingToChange)
+    );
+
+    // Editing settled history is not an edit
+    let done = close(&open, Lifecycle::Completed, at).unwrap();
+    assert_eq!(
+        amend(&done, Some("late".to_owned()), DueChange::Keep, at),
+        Err(HumanError::AlreadyClosed("completed"))
+    );
+}
+
+#[test]
+fn an_amendment_cannot_be_dated_before_the_row_it_changes() {
+    let open = todo("pay rent", None);
+    // A backward clock must not move the row outside its own history
+    let backwards = instant("2026-09-01T00:00:00Z");
+    let amended = amend(&open, Some("later".to_owned()), DueChange::Keep, backwards).unwrap();
+    assert_eq!(amended.updated_at(), open.updated_at());
 }
 
 #[test]
