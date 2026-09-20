@@ -1,5 +1,6 @@
 #![allow(clippy::pedantic)]
 
+pub mod adopt;
 pub mod config;
 pub mod domain;
 pub mod human;

@@ -7,6 +7,7 @@ use mg_remindr::{
 };
 use serde::Serialize;
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::ExitCode,
     str::FromStr,
@@ -118,6 +119,14 @@ struct HandleInput {
 enum InteropCommand {
     /// Export a complete validated mg-remindr snapshot
     Export,
+    /// Adopt the rows the retired PostgreSQL database still holds, into an empty store
+    AdoptPostgres(AdoptInput),
+}
+
+#[derive(Debug, Args)]
+struct AdoptInput {
+    /// A JSON file of the PostgreSQL tables, column for column
+    file: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -202,6 +211,10 @@ enum CliError {
     Storage(#[from] mg_remindr::storage::StorageError),
     #[error("output serialization failed")]
     Output,
+    #[error("the export file could not be read")]
+    UnreadableFile,
+    #[error(transparent)]
+    Adopt(#[from] mg_remindr::adopt::AdoptError),
     #[error(transparent)]
     Human(#[from] human::HumanError),
 }
@@ -230,6 +243,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Command::Todo { command } => run_todo(&path, command),
         Command::Interop { command } => match command {
             InteropCommand::Export => print_json(&mg_remindr::interop::export(&store(&path)?)?),
+            InteropCommand::AdoptPostgres(input) => adopt(&path, &input),
         },
         Command::Add(input) => add(&path, input),
         Command::Ls(input) => list(&path, &input),
@@ -367,6 +381,17 @@ fn close(path: &Path, lifecycle: Lifecycle, input: &HandleInput) -> Result<(), C
         return print_json(&replacement);
     }
     println!("{}", human::render(&replacement));
+    Ok(())
+}
+
+// Take the retired database's rows into a store that has none of its own
+fn adopt(path: &Path, input: &AdoptInput) -> Result<(), CliError> {
+    let document = fs::read_to_string(&input.file).map_err(|_| CliError::UnreadableFile)?;
+    let adopted = mg_remindr::adopt::adopt_postgres_rows(&store(path)?, &document)?;
+    println!(
+        "adopted {} projects, {} tags and {} todos; authority revision {}",
+        adopted.projects, adopted.tags, adopted.todos, adopted.revision
+    );
     Ok(())
 }
 

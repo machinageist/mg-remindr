@@ -76,6 +76,28 @@ override that default. The file is opened in WAL, with foreign keys on, so a
 reader works while a writer holds it. Every command parses its input before it
 opens the store, so unreadable input never creates one.
 
+## Adopting the retired PostgreSQL rows
+
+A store that mg-remindr has never written can take the old database's rows as they
+stand, keeping each reminder's identity, version and recorded times — which an
+interop import could not, because a todo at version three is neither a new todo nor
+a version-matched replacement:
+
+```bash
+psql -d mg_todo -tAc "
+select json_build_object(
+  'projects', coalesce((select json_agg(p) from projects p), '[]'::json),
+  'tags', coalesce((select json_agg(t) from tags t), '[]'::json),
+  'todos', coalesce((select json_agg(x) from todos x), '[]'::json),
+  'authority_revision', (select revision from mg_remindr_authority_state where singleton)
+)" > mg_todo.json
+mg-remindr interop adopt-postgres mg_todo.json
+```
+
+It refuses a store that already holds reminders, and refuses an export carrying tag
+links, parents, dependencies, recurrence or reminder deliveries rather than dropping
+them — that database had none, and the path was not built for what it never held.
+
 ## Development
 
 ```bash
