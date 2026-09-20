@@ -1,155 +1,98 @@
+// Author: Jeff
+// Date: 2026-09-19
+// Description: The SQLite authority for projects, tags, todos, and their recorded history
+// Notes: One file, WAL journal, foreign keys on, and an append-only migration ledger.
+//        Instants are stored as fixed-width RFC 3339 microseconds in UTC and civil dates
+//        as YYYY-MM-DD, so SQLite's text comparison is time comparison and the CHECK
+//        constraints the schema carries mean what they say. Every call takes its own
+//        connection, the way the PostgreSQL layer took its own session; a write that has
+//        to read first opens an immediate transaction so the optimistic version check and
+//        the write it authorizes cannot be interleaved.
+
 use crate::{
-    config::{DatabaseUrl, validate_local_database_url},
     domain::{
         DomainError, Lifecycle, Project, ProjectId, Tag, TagId, Todo, TodoDue, TodoId, Version,
     },
     recurrence::{Frequency, RecurrenceError, Rule},
-    reminder::{Channel, DeliveryRecord, Reminder, ReminderError},
+    reminder::{
+        Channel, DeliveryRecord, DeliveryStatus, Reminder, ReminderError, ReminderLifecycle,
+    },
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use chrono_tz::Tz;
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use thiserror::Error;
-use tokio_postgres::{Client, GenericClient, NoTls, Row, error::SqlState};
+use uuid::Uuid;
 
-pub const FOUNDATION_MIGRATION: &str = include_str!("../migrations/0001_project_authority.sql");
-pub const TAG_MIGRATION: &str = include_str!("../migrations/0002_tag_authority.sql");
-pub const TODO_MIGRATION: &str = include_str!("../migrations/0003_todo_authority.sql");
-pub const TODO_TAG_MIGRATION: &str = include_str!("../migrations/0004_todo_tag_authority.sql");
-pub const AUTHORITY_REVISION_MIGRATION: &str =
-    include_str!("../migrations/0005_authority_revision.sql");
-pub const TODO_RELATIONSHIP_MIGRATION: &str =
-    include_str!("../migrations/0006_todo_relationship_authority.sql");
-pub const TODO_RECURRENCE_MIGRATION: &str =
-    include_str!("../migrations/0007_todo_recurrence_authority.sql");
-pub const TODO_REMINDER_DELIVERY_MIGRATION: &str =
-    include_str!("../migrations/0009_todo_reminder_delivery_authority.sql");
-pub const TODO_LIFECYCLE_TIMES_MIGRATION: &str =
-    include_str!("../migrations/0010_todo_lifecycle_times.sql");
-pub const TODO_DUE_MIGRATION: &str = include_str!("../migrations/0011_todo_due.sql");
-pub const TODO_REMINDER_MIGRATION: &str =
-    include_str!("../migrations/0008_todo_reminder_authority.sql");
-pub const REMINDR_AUTHORITY_RENAME_MIGRATION: &str =
-    include_str!("../migrations/0012_remindr_authority_rename.sql");
-const LEDGER: &str = "mg_todo_schema_migrations";
-// Migration 12 renames the checkpoint table migration 5 created. Verification runs
-// before pending migrations apply, so a database still at version 11 must be checked
-// against the pre-rename name or it drifts before it can be migrated.
-const CHECKPOINT_MIGRATION: i64 = 5;
-const CHECKPOINT_RENAME_MIGRATION: i64 = 12;
-const CHECKPOINT_TABLE_RENAMED: &str = "mg_remindr_authority_state";
-const MIGRATION_LOCK: i64 = 73_407_463_646;
+// ── The embedded schema ──
 
+pub const AUTHORITY_MIGRATION: &str = include_str!("../migrations/0001_remindr_authority.sql");
+
+// How long a call waits for another writer before giving up
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const LEDGER: &str = "schema_migrations";
+const JOURNAL_MODE_WAL: &str = "wal";
+// A civil date is written the way a person writes one
+const DATE_FORMAT: &str = "%Y-%m-%d";
+// The one stored instant shape: fixed width, always UTC, so text order is time order
+const TIMESTAMP_PRECISION: SecondsFormat = SecondsFormat::Micros;
+const NANOS_PER_MICROSECOND: u32 = 1_000;
+
+const LIFECYCLE_OPEN: &str = "open";
+const LIFECYCLE_COMPLETED: &str = "completed";
+const LIFECYCLE_TRASHED: &str = "trashed";
+const CHANNEL_TUI: &str = "TUI";
+const CHANNEL_DESKTOP: &str = "DESKTOP";
+const CHANNEL_WEBHOOK: &str = "WEBHOOK";
+const REMINDER_ACTIVE: &str = "active";
+const REMINDER_PAUSED: &str = "paused";
+const REMINDER_CANCELLED: &str = "cancelled";
+const DELIVERY_PENDING: &str = "pending";
+const DELIVERY_SENT: &str = "sent";
+const DELIVERY_FAILED: &str = "failed";
+const FREQUENCY_DAILY: &str = "DAILY";
+const FREQUENCY_WEEKLY: &str = "WEEKLY";
+const FREQUENCY_MONTHLY: &str = "MONTHLY";
+
+/// One embedded schema migration.
+///
+/// `checksum` pins the exact SQL that was applied, and `tables` names what the migration
+/// is responsible for creating, so a ledger recording a version whose tables are absent
+/// is caught rather than skipped.
 #[derive(Debug, Clone, Copy)]
 pub struct Migration {
     pub version: i64,
     pub name: &'static str,
     pub sql: &'static str,
     pub checksum: &'static str,
-    pub table: &'static str,
-    /// False when the migration extends a table an earlier migration created
-    pub creates_table: bool,
+    pub tables: &'static [&'static str],
 }
 
-pub const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        name: "project_authority",
-        sql: FOUNDATION_MIGRATION,
-        checksum: "0c821017adbb6c219ad371a7729b7d898a178bd9102279d71524504710ed78c0",
-        table: "projects",
-        creates_table: true,
-    },
-    Migration {
-        version: 2,
-        name: "tag_authority",
-        sql: TAG_MIGRATION,
-        checksum: "4d94c603ee44bbb7e649011d49bdd5325f98ff4abcffa232eb8e0a7770286126",
-        table: "tags",
-        creates_table: true,
-    },
-    Migration {
-        version: 3,
-        name: "todo_authority",
-        sql: TODO_MIGRATION,
-        checksum: "0f9e31afdb4b2ae562fb065a48b683e0c554cf124ea4e97296ab6630f20af6f2",
-        table: "todos",
-        creates_table: true,
-    },
-    Migration {
-        version: 4,
-        name: "todo_tag_authority",
-        sql: TODO_TAG_MIGRATION,
-        checksum: "fffb6336ac6d6c02a39dfcf96333858eab15d947594ac50104dfdae57e358716",
-        table: "todo_tags",
-        creates_table: true,
-    },
-    Migration {
-        version: 5,
-        name: "authority_revision",
-        sql: AUTHORITY_REVISION_MIGRATION,
-        checksum: "680eaac3aac4b42fe2db5e0e681df0a1b4eb4d5170d7751b1a4f0b84e6f9239d",
-        table: "mg_todo_authority_state",
-        creates_table: true,
-    },
-    Migration {
-        version: 6,
-        name: "todo_relationship_authority",
-        sql: TODO_RELATIONSHIP_MIGRATION,
-        checksum: "9eca75aa95299df898d1bc7e1a0d27fa54de43b04d94e8e7ed0eda0809ecf36d",
-        table: "todo_parents",
-        creates_table: true,
-    },
-    Migration {
-        version: 7,
-        name: "todo_recurrence_authority",
-        sql: TODO_RECURRENCE_MIGRATION,
-        checksum: "391adbe0240486d80938eb2651d15dd43736d3e9249608a32701ea82e8d20781",
-        table: "todo_recurrence",
-        creates_table: true,
-    },
-    Migration {
-        version: 8,
-        name: "todo_reminder_authority",
-        sql: TODO_REMINDER_MIGRATION,
-        checksum: "ae7dcac9333555742d19bb5bdc6dc92810769ef394215181c5577655c5f40b38",
-        table: "todo_reminders",
-        creates_table: true,
-    },
-    Migration {
-        version: 9,
-        name: "todo_reminder_delivery_authority",
-        sql: TODO_REMINDER_DELIVERY_MIGRATION,
-        checksum: "8ce0adab4da891d8e0f152f9907b9db680f32a1b1ae604b57dde173baf31a67f",
-        table: "todo_reminder_deliveries",
-        creates_table: true,
-    },
-    Migration {
-        version: 10,
-        name: "todo_lifecycle_times",
-        sql: TODO_LIFECYCLE_TIMES_MIGRATION,
-        checksum: "52136781e923df4fac3924744e45f2d35516a82803450542c692f7bc780dfd27",
-        table: "todos",
-        creates_table: false,
-    },
-    Migration {
-        version: 11,
-        name: "todo_due",
-        sql: TODO_DUE_MIGRATION,
-        checksum: "7eb26c53a3828c0b5f2d76e451f5861a17dd39b80ebc024c9edf97c49f87c25d",
-        table: "todos",
-        creates_table: false,
-    },
-    Migration {
-        version: 12,
-        name: "remindr_authority_rename",
-        sql: REMINDR_AUTHORITY_RENAME_MIGRATION,
-        checksum: "d668bbe4507dd58be96789b64ea129f6852339eb81ea59c216d7dc3507101473",
-        table: "mg_remindr_authority_state",
-        creates_table: false,
-    },
-];
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "remindr_authority",
+    sql: AUTHORITY_MIGRATION,
+    checksum: "d6ca601c121e83677e761e35a442d4d3df86438e0cb8cf0a5cd3df749f67fe22",
+    tables: &[
+        "projects",
+        "tags",
+        "todos",
+        "todo_tags",
+        "todo_parents",
+        "todo_dependencies",
+        "todo_recurrence",
+        "todo_reminders",
+        "todo_reminder_deliveries",
+        "mg_remindr_authority_state",
+    ],
+}];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MigrationState {
@@ -158,7 +101,7 @@ pub struct MigrationState {
     pub applied: bool,
 }
 
-/// One repeatable-read view of all currently persisted todo authority state.
+/// One consistent view of all currently persisted authority state.
 #[derive(Debug, Clone)]
 pub struct AuthorityExport {
     pub projects: Vec<Project>,
@@ -167,12 +110,10 @@ pub struct AuthorityExport {
     pub revision: u64,
 }
 
-/// Stable storage failures. Driver errors are intentionally redacted so URLs and
-/// credentials cannot enter display or debug output.
+/// Stable storage failures. Driver errors are intentionally redacted so paths and
+/// driver text cannot enter display or debug output.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum StorageError {
-    #[error("database configuration is not local-only")]
-    InvalidConfiguration,
     #[error("mg-remindr database connection failed")]
     Connect,
     #[error("mg-remindr database operation failed during {operation}")]
@@ -187,8 +128,6 @@ pub enum StorageError {
     UnknownMigration { version: i64, name: String },
     #[error("migration {version} SQL checksum drift")]
     MigrationChecksumDrift { version: i64 },
-    #[error("migration {version} SQL checksum is missing")]
-    MigrationChecksumMissing { version: i64 },
     #[error("migration {version} schema drift for table '{table}'")]
     MigrationSchemaDrift { version: i64, table: &'static str },
     #[error("unledgered migration table '{table}' already exists")]
@@ -228,7 +167,7 @@ pub enum StorageError {
     InvalidTagReplacement { reason: &'static str },
     #[error("invalid tag creation: {reason}")]
     InvalidTagCreation { reason: &'static str },
-    #[error("{field} must be exactly representable at PostgreSQL microsecond precision")]
+    #[error("{field} must be exactly representable at microsecond precision")]
     InvalidTimestampPrecision { field: &'static str },
     #[error("invalid stored tag data")]
     InvalidStoredTagData,
@@ -262,681 +201,300 @@ pub enum StorageError {
     Domain(#[from] DomainError),
 }
 
-async fn connect(database_url: &DatabaseUrl) -> Result<Client, StorageError> {
-    validate_local_database_url(database_url.as_str())
-        .map_err(|_| StorageError::InvalidConfiguration)?;
-    let (client, connection) = tokio_postgres::connect(database_url.as_str(), NoTls)
-        .await
-        .map_err(|_| StorageError::Connect)?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    Ok(client)
+// Report a driver failure as the operation that asked for it, never as driver text
+fn database(operation: &'static str) -> impl Fn(rusqlite::Error) -> StorageError {
+    move |_| StorageError::Database { operation }
 }
 
-#[derive(Debug, Clone)]
-struct AuthoritySchema {
-    name: String,
-    quoted: String,
-}
-
-impl AuthoritySchema {
-    fn table(&self, table: &str) -> String {
-        format!("{}.{table}", self.quoted)
+// A primary-key or UNIQUE clash means the caller's record is already here
+fn is_unique_violation(error: &rusqlite::Error) -> bool {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _) => matches!(
+            failure.extended_code,
+            rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY | rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+        ),
+        _ => false,
     }
 }
 
-async fn connect_authority(
-    database_url: &DatabaseUrl,
-    operation: &'static str,
-) -> Result<(Client, AuthoritySchema), StorageError> {
-    let client = connect(database_url).await?;
-    let row = client
-        .query_one(
-            "SELECT current_schema(), quote_ident(current_schema())",
-            &[],
-        )
-        .await
-        .map_err(|_| StorageError::Database { operation })?;
-    let name = row
-        .get::<_, Option<String>>(0)
-        .ok_or(StorageError::Database { operation })?;
-    let quoted = row
-        .get::<_, Option<String>>(1)
-        .ok_or(StorageError::Database { operation })?;
-    let restricted_path = format!("{quoted}, pg_catalog");
-    client
-        .query_one(
-            "SELECT set_config('search_path', $1, false)",
-            &[&restricted_path],
-        )
-        .await
-        .map_err(|_| StorageError::Database { operation })?;
-    Ok((client, AuthoritySchema { name, quoted }))
+// ── The store ──
+
+/// One SQLite file holding the whole authority.
+#[derive(Debug, Clone)]
+pub struct Store {
+    path: PathBuf,
 }
+
+impl Store {
+    /// Open the store at one path and apply every migration it has not recorded.
+    ///
+    /// # Errors
+    /// Returns an error when the file cannot be opened or its ledger disagrees with
+    /// the embedded migrations.
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
+        let store = Self::attach(path)?;
+        let mut connection = store.conn()?;
+        apply_migrations(&mut connection)?;
+        Ok(store)
+    }
+
+    /// The file this store lives in.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    // Open the file and settle its journal mode without applying anything
+    fn attach(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
+        let path = path.into();
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|_| StorageError::Connect)?;
+        }
+        let store = Self { path };
+        let connection = store.conn()?;
+        // WAL lets a reader work while a writer holds the file; the mode is stored in the file
+        let mode: String = connection
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .map_err(|_| StorageError::Connect)?;
+        if !mode.eq_ignore_ascii_case(JOURNAL_MODE_WAL) {
+            return Err(StorageError::Connect);
+        }
+        Ok(store)
+    }
+
+    // One connection per call, with the pragmas that are not stored in the file
+    fn conn(&self) -> Result<Connection, StorageError> {
+        let connection = Connection::open(&self.path).map_err(|_| StorageError::Connect)?;
+        connection
+            .busy_timeout(BUSY_TIMEOUT)
+            .map_err(|_| StorageError::Connect)?;
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(|_| StorageError::Connect)?;
+        Ok(connection)
+    }
+}
+
+// ── Migrations ──
 
 /// Read migration state without creating or changing the ledger.
-pub async fn migration_status(
-    database_url: &DatabaseUrl,
-) -> Result<Vec<MigrationState>, StorageError> {
-    let (client, schema) = connect_authority(database_url, "migration status").await?;
-    let exists: bool = client
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-             WHERE table_schema = $1 AND table_name = $2)",
-            &[&schema.name, &LEDGER],
-        )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "migration status",
-        })?
-        .get(0);
-    if !exists {
-        validate_migration_sources()?;
-        verify_migration_schemas(&client, &schema, &[]).await?;
-        return Ok(MIGRATIONS
-            .iter()
-            .map(|migration| MigrationState {
-                version: migration.version,
-                name: migration.name.to_owned(),
-                applied: false,
-            })
-            .collect());
-    }
-
-    let has_checksum: bool = client
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-             WHERE table_schema = $1 AND table_name = $2 \
-             AND column_name = 'checksum')",
-            &[&schema.name, &LEDGER],
-        )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "migration status",
-        })?
-        .get(0);
-    let ledger = schema.table(LEDGER);
-    let query = if has_checksum {
-        format!("SELECT version, name, checksum FROM {ledger} ORDER BY version")
-    } else {
-        format!("SELECT version, name, NULL::text AS checksum FROM {ledger} ORDER BY version")
-    };
-    let rows = client
-        .query(&query, &[])
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "migration status",
-        })?;
-    validate_recorded_migrations(&rows, has_checksum)?;
+///
+/// # Errors
+/// Returns an error when the file cannot be opened or its ledger disagrees with
+/// the embedded migrations.
+pub fn migration_status(path: &Path) -> Result<Vec<MigrationState>, StorageError> {
+    const OPERATION: &str = "migration status";
+    let store = Store::attach(path)?;
+    let connection = store.conn()?;
     validate_migration_sources()?;
-    verify_migration_schemas(&client, &schema, &rows).await?;
-    MIGRATIONS
+    let recorded = recorded_migrations(&connection, OPERATION)?;
+    validate_recorded_migrations(&recorded)?;
+    verify_recorded_tables(&connection, &recorded, OPERATION)?;
+    verify_unledgered_tables(&connection, &recorded, OPERATION)?;
+    Ok(MIGRATIONS
         .iter()
-        .map(|migration| {
-            let recorded = rows
+        .map(|migration| MigrationState {
+            version: migration.version,
+            name: migration.name.to_owned(),
+            applied: recorded
                 .iter()
-                .find(|row| row.get::<_, i64>(0) == migration.version);
-            if let Some(row) = recorded {
-                let actual = row.get::<_, String>(1);
-                if actual != migration.name {
-                    return Err(StorageError::MigrationDrift {
-                        version: migration.version,
-                        expected: migration.name,
-                        actual,
-                    });
-                }
-            }
-            Ok(MigrationState {
-                version: migration.version,
-                name: migration.name.to_owned(),
-                applied: recorded.is_some(),
-            })
+                .any(|(version, ..)| *version == migration.version),
         })
-        .collect()
+        .collect())
 }
 
-/// Apply all pending embedded migrations under a transaction-scoped advisory lock.
-/// Schema SQL and its ledger row commit atomically; rerunning is idempotent.
-pub async fn migrate(database_url: &DatabaseUrl) -> Result<Vec<MigrationState>, StorageError> {
-    let (mut client, schema) = connect_authority(database_url, "migration").await?;
-    let transaction = client
-        .transaction()
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "migration",
-        })?;
-    transaction
-        .query_one("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK])
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "migration",
-        })?;
+/// Apply every pending embedded migration; rerunning is idempotent.
+///
+/// # Errors
+/// Returns an error when the file cannot be opened, the ledger disagrees with the
+/// embedded migrations, or a migration fails to apply.
+pub fn migrate(path: &Path) -> Result<Vec<MigrationState>, StorageError> {
+    let store = Store::attach(path)?;
+    let mut connection = store.conn()?;
+    apply_migrations(&mut connection)?;
+    migration_status(path)
+}
 
-    let ledger = schema.table(LEDGER);
-    let ledger_exists: bool = transaction
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-             WHERE table_schema = $1 AND table_name = $2)",
-            &[&schema.name, &LEDGER],
-        )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "migration",
-        })?
-        .get(0);
-    let had_checksum = if ledger_exists {
-        transaction
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-                 WHERE table_schema = $1 AND table_name = $2 AND column_name = 'checksum')",
-                &[&schema.name, &LEDGER],
-            )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "migration",
-            })?
-            .get(0)
-    } else {
-        false
-    };
-
-    let recorded = if ledger_exists {
-        let query = if had_checksum {
-            format!("SELECT version, name, checksum FROM {ledger} ORDER BY version")
-        } else {
-            format!("SELECT version, name, NULL::text AS checksum FROM {ledger} ORDER BY version")
-        };
-        transaction
-            .query(&query, &[])
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "migration",
-            })?
-    } else {
-        Vec::new()
-    };
-    validate_recorded_migrations(&recorded, had_checksum)?;
+// Ledger discovery and every pending migration share one write transaction, so two
+// first-time opens cannot both see an empty ledger and race to create the schema
+fn apply_migrations(connection: &mut Connection) -> Result<(), StorageError> {
+    const OPERATION: &str = "migration";
     validate_migration_sources()?;
-    verify_migration_schemas(&transaction, &schema, &recorded).await?;
-
-    if !ledger_exists {
-        transaction
-            .batch_execute(&format!(
-                "CREATE TABLE {ledger} (\
-                 version bigint PRIMARY KEY, \
-                 name text NOT NULL, \
-                 checksum text NOT NULL, \
-                 applied_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP)"
-            ))
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "migration",
-            })?;
-    } else if !had_checksum {
-        transaction
-            .batch_execute(&format!("ALTER TABLE {ledger} ADD COLUMN checksum text"))
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "migration",
-            })?;
-        for migration in MIGRATIONS {
-            let checksum = migration_checksum(migration);
-            transaction
-                .execute(
-                    &format!(
-                        "UPDATE {ledger} SET checksum = $1 \
-                         WHERE version = $2 AND name = $3 AND checksum IS NULL"
-                    ),
-                    &[&checksum, &migration.version, &migration.name],
-                )
-                .await
-                .map_err(|_| StorageError::Database {
-                    operation: "migration",
-                })?;
-        }
-        transaction
-            .batch_execute(&format!(
-                "ALTER TABLE {ledger} ALTER COLUMN checksum SET NOT NULL"
-            ))
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "migration",
-            })?;
-    }
-
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database(OPERATION))?;
+    transaction
+        .execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS {LEDGER} (\
+             version INTEGER PRIMARY KEY, \
+             name TEXT NOT NULL, \
+             checksum TEXT NOT NULL, \
+             applied_at TEXT NOT NULL);"
+        ))
+        .map_err(database(OPERATION))?;
+    let recorded = recorded_migrations(&transaction, OPERATION)?;
+    validate_recorded_migrations(&recorded)?;
+    verify_recorded_tables(&transaction, &recorded, OPERATION)?;
+    verify_unledgered_tables(&transaction, &recorded, OPERATION)?;
     for migration in MIGRATIONS {
-        let existing = recorded
+        if recorded
             .iter()
-            .any(|row| row.get::<_, i64>(0) == migration.version);
-        if existing {
+            .any(|(version, ..)| *version == migration.version)
+        {
             continue;
         }
         transaction
-            .batch_execute(&qualified_migration_sql(migration, &schema))
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "migration",
-            })?;
-        verify_table_schema(&transaction, &schema, migration, migration.table).await?;
-        let checksum = migration_checksum(migration);
+            .execute_batch(migration.sql)
+            .map_err(database(OPERATION))?;
         transaction
             .execute(
-                &format!("INSERT INTO {ledger} (version, name, checksum) VALUES ($1, $2, $3)"),
-                &[&migration.version, &migration.name, &checksum],
+                &format!(
+                    "INSERT INTO {LEDGER} (version, name, checksum, applied_at) \
+                     VALUES (?1, ?2, ?3, ?4)"
+                ),
+                params![
+                    migration.version,
+                    migration.name,
+                    migration.checksum,
+                    timestamp_text(Utc::now())
+                ],
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "migration",
-            })?;
+            .map_err(database(OPERATION))?;
     }
-    transaction
-        .commit()
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "migration",
-        })?;
-    migration_status(database_url).await
+    transaction.commit().map_err(database(OPERATION))?;
+    Ok(())
 }
 
-fn validate_recorded_migrations(rows: &[Row], checksum_required: bool) -> Result<(), StorageError> {
-    for row in rows {
-        let version = row.get::<_, i64>(0);
-        let name = row.get::<_, String>(1);
+// What the ledger says, in version order; an absent ledger has recorded nothing
+fn recorded_migrations(
+    connection: &Connection,
+    operation: &'static str,
+) -> Result<Vec<(i64, String, String)>, StorageError> {
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            params![LEDGER],
+            |row| row.get(0),
+        )
+        .map_err(database(operation))?;
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT version, name, checksum FROM {LEDGER} ORDER BY version"
+        ))
+        .map_err(database(operation))?;
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .map_err(database(operation))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(database(operation))
+}
+
+// Refuse a ledger that names a migration this build does not carry, renames one,
+// records a different SQL body, or skips a version
+fn validate_recorded_migrations(recorded: &[(i64, String, String)]) -> Result<(), StorageError> {
+    for (version, name, checksum) in recorded {
         let Some(expected) = MIGRATIONS
             .iter()
-            .find(|migration| migration.version == version)
+            .find(|migration| migration.version == *version)
         else {
-            return Err(StorageError::UnknownMigration { version, name });
+            return Err(StorageError::UnknownMigration {
+                version: *version,
+                name: name.clone(),
+            });
         };
         if name != expected.name {
             return Err(StorageError::MigrationDrift {
-                version,
+                version: *version,
                 expected: expected.name,
-                actual: name,
+                actual: name.clone(),
             });
         }
-        match row.get::<_, Option<String>>(2) {
-            Some(checksum) if checksum != migration_checksum(expected) => {
-                return Err(StorageError::MigrationChecksumDrift { version });
-            }
-            None if checksum_required => {
-                return Err(StorageError::MigrationChecksumMissing { version });
-            }
-            Some(_) | None => {}
+        if checksum != expected.checksum {
+            return Err(StorageError::MigrationChecksumDrift { version: *version });
         }
     }
-    for (index, row) in rows.iter().enumerate() {
-        let expected = &MIGRATIONS[index];
-        let applied_version = row.get::<_, i64>(0);
-        if applied_version != expected.version {
+    for (index, (applied_version, ..)) in recorded.iter().enumerate() {
+        let expected = MIGRATIONS[index].version;
+        if *applied_version != expected {
             return Err(StorageError::MigrationHistoryGap {
-                missing_version: expected.version,
-                applied_version,
+                missing_version: expected,
+                applied_version: *applied_version,
             });
         }
     }
     Ok(())
 }
 
-async fn verify_migration_schemas<C: GenericClient + Sync>(
-    client: &C,
-    schema: &AuthoritySchema,
-    recorded: &[Row],
+// A recorded migration whose tables are gone is drift, not a store to keep writing to
+fn verify_recorded_tables(
+    connection: &Connection,
+    recorded: &[(i64, String, String)],
+    operation: &'static str,
 ) -> Result<(), StorageError> {
-    let renamed = recorded
-        .iter()
-        .any(|row| row.get::<_, i64>(0) == CHECKPOINT_RENAME_MIGRATION);
-    for migration in MIGRATIONS {
-        let table = live_table(migration, renamed);
-        let applied = recorded
+    for (version, ..) in recorded {
+        let Some(migration) = MIGRATIONS
             .iter()
-            .any(|row| row.get::<_, i64>(0) == migration.version);
-        let exists: bool = client
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
-                 WHERE table_schema = $1 AND table_name = $2 AND table_type = 'BASE TABLE')",
-                &[&schema.name, &table],
-            )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "migration schema verification",
-            })?
-            .get(0);
-        match (applied, exists) {
-            // A table's live shape answers to the newest applied migration that touched it
-            (true, true) => {
-                if newest_applied_for_table(recorded, table, renamed) == migration.version {
-                    verify_table_schema(client, schema, migration, table).await?;
-                }
-            }
-            (true, false) => {
+            .find(|migration| migration.version == *version)
+        else {
+            continue;
+        };
+        for table in migration.tables {
+            if !table_exists(connection, table, operation)? {
                 return Err(StorageError::MigrationSchemaDrift {
-                    version: migration.version,
+                    version: *version,
                     table,
                 });
             }
-            // An unapplied migration that only extends an earlier table is not an unledgered table
-            (false, true) if migration.creates_table => {
-                return Err(StorageError::UnledgeredMigrationTable { table });
-            }
-            (false, _) => {}
         }
     }
     Ok(())
 }
 
-/// The table name a migration answers to right now, following the checkpoint rename.
-fn live_table(migration: &Migration, renamed: bool) -> &'static str {
-    if renamed && migration.version == CHECKPOINT_MIGRATION {
-        return CHECKPOINT_TABLE_RENAMED;
-    }
-    migration.table
-}
-
-/// Newest applied migration version touching one table, or zero when none is applied.
-fn newest_applied_for_table(recorded: &[Row], table: &str, renamed: bool) -> i64 {
-    MIGRATIONS
-        .iter()
-        .filter(|migration| live_table(migration, renamed) == table)
-        .filter(|migration| {
-            recorded
-                .iter()
-                .any(|row| row.get::<_, i64>(0) == migration.version)
-        })
-        .map(|migration| migration.version)
-        .max()
-        .unwrap_or_default()
-}
-
-async fn verify_table_schema<C: GenericClient + Sync>(
-    client: &C,
-    schema: &AuthoritySchema,
-    migration: &Migration,
-    table: &'static str,
+// A table this build owns that no ledger row explains was not put there by mg-remindr
+fn verify_unledgered_tables(
+    connection: &Connection,
+    recorded: &[(i64, String, String)],
+    operation: &'static str,
 ) -> Result<(), StorageError> {
-    let rows = client
-        .query(
-            "SELECT column_name, udt_name, is_nullable, column_default \
-             FROM information_schema.columns \
-             WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
-            &[&schema.name, &table],
-        )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "migration schema verification",
-        })?;
-    let actual = rows
-        .iter()
-        .map(|row| {
-            (
-                row.get::<_, String>(0),
-                row.get::<_, String>(1),
-                row.get::<_, String>(2),
-                row.get::<_, Option<String>>(3),
-            )
-        })
-        .collect::<Vec<_>>();
-    let expected = match migration.version {
-        1 => vec![
-            ("id", "uuid", "NO", None),
-            ("name", "text", "NO", None),
-            ("lifecycle", "text", "NO", None),
-            ("version", "int8", "NO", None),
-            ("created_at", "timestamptz", "NO", None),
-            ("updated_at", "timestamptz", "NO", None),
-        ],
-        2 => vec![
-            ("id", "uuid", "NO", None),
-            ("name", "text", "NO", None),
-            ("version", "int8", "NO", None),
-            ("created_at", "timestamptz", "NO", None),
-            ("updated_at", "timestamptz", "NO", None),
-        ],
-        3 => vec![
-            ("id", "uuid", "NO", None),
-            ("title", "text", "NO", None),
-            ("project_id", "uuid", "YES", None),
-            ("lifecycle", "text", "NO", None),
-            ("version", "int8", "NO", None),
-            ("created_at", "timestamptz", "NO", None),
-            ("updated_at", "timestamptz", "NO", None),
-        ],
-        4 => vec![
-            ("todo_id", "uuid", "NO", None),
-            ("tag_id", "uuid", "NO", None),
-        ],
-        5 => vec![
-            ("singleton", "bool", "NO", Some("true")),
-            ("revision", "int8", "NO", None),
-            ("changed_at", "timestamptz", "NO", None),
-        ],
-        6 => vec![
-            ("child_id", "uuid", "NO", None),
-            ("parent_id", "uuid", "NO", None),
-        ],
-        7 => vec![
-            ("todo_id", "uuid", "NO", None),
-            ("start_date", "date", "NO", None),
-            ("frequency", "text", "NO", None),
-            ("interval", "int8", "NO", None),
-            ("occurrence_count", "int8", "YES", None),
-            ("until_date", "date", "YES", None),
-        ],
-        8 => vec![
-            ("id", "uuid", "NO", None),
-            ("todo_id", "uuid", "NO", None),
-            ("remind_at", "timestamptz", "NO", None),
-            ("channel", "text", "NO", None),
-            ("lifecycle", "text", "NO", None),
-            ("version", "int8", "NO", None),
-            ("created_at", "timestamptz", "NO", None),
-            ("updated_at", "timestamptz", "NO", None),
-        ],
-        9 => vec![
-            ("id", "uuid", "NO", None),
-            ("reminder_id", "uuid", "NO", None),
-            ("idempotency_key", "text", "NO", None),
-            ("status", "text", "NO", None),
-            ("attempted_at", "timestamptz", "YES", None),
-            ("provider_reference", "text", "YES", None),
-            ("failure_code", "text", "YES", None),
-            ("created_at", "timestamptz", "NO", None),
-        ],
-        10 => vec![
-            ("id", "uuid", "NO", None),
-            ("title", "text", "NO", None),
-            ("project_id", "uuid", "YES", None),
-            ("lifecycle", "text", "NO", None),
-            ("version", "int8", "NO", None),
-            ("created_at", "timestamptz", "NO", None),
-            ("updated_at", "timestamptz", "NO", None),
-            ("completed_at", "timestamptz", "YES", None),
-            ("trashed_at", "timestamptz", "YES", None),
-        ],
-        11 => vec![
-            ("id", "uuid", "NO", None),
-            ("title", "text", "NO", None),
-            ("project_id", "uuid", "YES", None),
-            ("lifecycle", "text", "NO", None),
-            ("version", "int8", "NO", None),
-            ("created_at", "timestamptz", "NO", None),
-            ("updated_at", "timestamptz", "NO", None),
-            ("completed_at", "timestamptz", "YES", None),
-            ("trashed_at", "timestamptz", "YES", None),
-            ("due_date", "date", "YES", None),
-            ("due_at", "timestamptz", "YES", None),
-            ("due_timezone", "text", "YES", None),
-        ],
-        // A pure rename: the checkpoint table keeps the shape migration 5 gave it
-        12 => vec![
-            ("singleton", "bool", "NO", Some("true")),
-            ("revision", "int8", "NO", None),
-            ("changed_at", "timestamptz", "NO", None),
-        ],
-        _ => unreachable!("known migrations only"),
-    };
-    if actual
-        != expected
-            .into_iter()
-            .map(|(name, kind, nullable, default)| {
-                (
-                    name.to_owned(),
-                    kind.to_owned(),
-                    nullable.to_owned(),
-                    default.map(str::to_owned),
-                )
-            })
-            .collect::<Vec<_>>()
-    {
-        return Err(StorageError::MigrationSchemaDrift {
-            version: migration.version,
-            table,
-        });
-    }
-
-    let constraint_rows = client
-        .query(
-            "SELECT pg_catalog.pg_get_constraintdef(c.oid, true), c.convalidated \
-             FROM pg_catalog.pg_constraint c \
-             JOIN pg_catalog.pg_class t ON t.oid = c.conrelid \
-             JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace \
-             WHERE n.nspname = $1 AND t.relname = $2 AND c.contype IN ('p', 'c', 'f', 'u') \
-             ORDER BY c.contype, c.conname",
-            &[&schema.name, &migration.table],
-        )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "migration schema verification",
-        })?;
-    if constraint_rows.iter().any(|row| !row.get::<_, bool>(1)) {
-        return Err(StorageError::MigrationSchemaDrift {
-            version: migration.version,
-            table,
-        });
-    }
-    let constraints = constraint_rows
-        .iter()
-        .map(|row| row.get::<_, String>(0))
-        .collect::<Vec<_>>();
-    let required = match migration.version {
-        1 => vec![
-            "PRIMARY KEY (id)",
-            "CHECK (btrim(name) <> ''::text)",
-            "CHECK (lifecycle = ANY (ARRAY['open'::text, 'completed'::text, 'trashed'::text]))",
-            "CHECK (version >= 1)",
-            "CHECK (updated_at >= created_at)",
-        ],
-        2 => vec![
-            "PRIMARY KEY (id)",
-            "CHECK (btrim(name) <> ''::text)",
-            "CHECK (version >= 1)",
-            "CHECK (updated_at >= created_at)",
-        ],
-        3 => vec![
-            "PRIMARY KEY (id)",
-            "FOREIGN KEY (project_id) REFERENCES projects(id)",
-            "CHECK (btrim(title) <> ''::text)",
-            "CHECK (lifecycle = ANY (ARRAY['open'::text, 'completed'::text, 'trashed'::text]))",
-            "CHECK (version >= 1)",
-            "CHECK (updated_at >= created_at)",
-        ],
-        4 => vec![
-            "PRIMARY KEY (todo_id, tag_id)",
-            "FOREIGN KEY (todo_id) REFERENCES todos(id) ON DELETE CASCADE",
-            "FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE RESTRICT",
-        ],
-        5 => vec![
-            "PRIMARY KEY (singleton)",
-            "CHECK (singleton)",
-            "CHECK (revision >= 1)",
-        ],
-        6 => vec![
-            "PRIMARY KEY (child_id)",
-            "FOREIGN KEY (child_id) REFERENCES todos(id) ON DELETE CASCADE",
-            "FOREIGN KEY (parent_id) REFERENCES todos(id) ON DELETE RESTRICT",
-            "CHECK (child_id <> parent_id)",
-        ],
-        7 => vec![
-            "PRIMARY KEY (todo_id)",
-            "FOREIGN KEY (todo_id) REFERENCES todos(id) ON DELETE CASCADE",
-            "CHECK (frequency = ANY (ARRAY['DAILY'::text, 'WEEKLY'::text, 'MONTHLY'::text]))",
-            "CHECK (\"interval\" >= 1 AND \"interval\" <= 366)",
-            "CHECK (occurrence_count >= 1 AND occurrence_count <= 1000)",
-            "CHECK (occurrence_count IS NOT NULL OR until_date IS NOT NULL)",
-            "CHECK (until_date IS NULL OR until_date > start_date)",
-        ],
-        8 => vec![
-            "PRIMARY KEY (id)",
-            "FOREIGN KEY (todo_id) REFERENCES todos(id) ON DELETE CASCADE",
-            "CHECK (channel = ANY (ARRAY['TUI'::text, 'DESKTOP'::text, 'WEBHOOK'::text]))",
-            "CHECK (lifecycle = ANY (ARRAY['active'::text, 'paused'::text, 'cancelled'::text]))",
-            "CHECK (version >= 1)",
-            "CHECK (updated_at >= created_at)",
-        ],
-        9 => vec![
-            "PRIMARY KEY (id)",
-            "FOREIGN KEY (reminder_id) REFERENCES todo_reminders(id) ON DELETE CASCADE",
-            "UNIQUE (idempotency_key)",
-            "CHECK (btrim(idempotency_key) <> ''::text)",
-            "CHECK (attempted_at IS NULL OR attempted_at >= created_at)",
-            "CHECK (status = ANY (ARRAY['pending'::text, 'sent'::text, 'failed'::text]))",
-            "CHECK (status <> 'sent'::text OR provider_reference IS NOT NULL)",
-            "CHECK (status <> 'failed'::text OR failure_code IS NOT NULL)",
-            "CHECK (status = 'pending'::text OR attempted_at IS NOT NULL)",
-            "CHECK (status <> 'pending'::text OR attempted_at IS NULL)",
-        ],
-        10 => vec![
-            "PRIMARY KEY (id)",
-            "FOREIGN KEY (project_id) REFERENCES projects(id)",
-            "CHECK (btrim(title) <> ''::text)",
-            "CHECK (lifecycle = ANY (ARRAY['open'::text, 'completed'::text, 'trashed'::text]))",
-            "CHECK (version >= 1)",
-            "CHECK (updated_at >= created_at)",
-            "CHECK ((lifecycle = 'completed'::text) = (completed_at IS NOT NULL))",
-            "CHECK ((lifecycle = 'trashed'::text) = (trashed_at IS NOT NULL))",
-            "CHECK (completed_at IS NULL OR completed_at >= created_at AND completed_at <= updated_at)",
-            "CHECK (trashed_at IS NULL OR trashed_at >= created_at AND trashed_at <= updated_at)",
-        ],
-        11 => vec![
-            "PRIMARY KEY (id)",
-            "FOREIGN KEY (project_id) REFERENCES projects(id)",
-            "CHECK (btrim(title) <> ''::text)",
-            "CHECK (lifecycle = ANY (ARRAY['open'::text, 'completed'::text, 'trashed'::text]))",
-            "CHECK (version >= 1)",
-            "CHECK (updated_at >= created_at)",
-            "CHECK ((lifecycle = 'completed'::text) = (completed_at IS NOT NULL))",
-            "CHECK ((lifecycle = 'trashed'::text) = (trashed_at IS NOT NULL))",
-            "CHECK (completed_at IS NULL OR completed_at >= created_at AND completed_at <= updated_at)",
-            "CHECK (trashed_at IS NULL OR trashed_at >= created_at AND trashed_at <= updated_at)",
-            "CHECK (due_date IS NULL AND due_at IS NULL AND due_timezone IS NULL OR due_timezone IS NOT NULL AND (due_date IS NULL) <> (due_at IS NULL))",
-            "CHECK (due_timezone IS NULL OR btrim(due_timezone) <> ''::text)",
-        ],
-        // A pure rename: the checkpoint table keeps the constraints migration 5 gave it
-        12 => vec![
-            "PRIMARY KEY (singleton)",
-            "CHECK (singleton)",
-            "CHECK (revision >= 1)",
-        ],
-        _ => unreachable!("known migrations only"),
-    };
-    let mut constraints = constraints;
-    constraints.sort_unstable();
-    let mut required = required;
-    required.sort_unstable();
-    if constraints != required {
-        return Err(StorageError::MigrationSchemaDrift {
-            version: migration.version,
-            table,
-        });
+    for migration in MIGRATIONS {
+        if recorded
+            .iter()
+            .any(|(version, ..)| *version == migration.version)
+        {
+            continue;
+        }
+        for table in migration.tables {
+            if table_exists(connection, table, operation)? {
+                return Err(StorageError::UnledgeredMigrationTable { table });
+            }
+        }
     }
     Ok(())
 }
 
-fn migration_checksum(migration: &Migration) -> String {
-    migration.checksum.to_owned()
+fn table_exists(
+    connection: &Connection,
+    table: &str,
+    operation: &'static str,
+) -> Result<bool, StorageError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            params![table],
+            |row| row.get(0),
+        )
+        .map_err(database(operation))
 }
 
+// Refuse an embedded migration whose SQL no longer matches its recorded checksum.
+// Without this the checksum is decoration: editing a migration and its checksum
+// together would still let a rewritten migration reach a database.
 fn validate_migration_sources() -> Result<(), StorageError> {
     for migration in MIGRATIONS {
         if calculated_migration_checksum(migration) != migration.checksum {
@@ -961,138 +519,108 @@ fn calculated_migration_checksum(migration: &Migration) -> String {
         .collect()
 }
 
-fn qualified_migration_sql(migration: &Migration, schema: &AuthoritySchema) -> String {
-    migration.sql.replacen(
-        "CREATE TABLE ",
-        &format!("CREATE TABLE {}.", schema.quoted),
-        1,
-    )
-}
+// ── Projects ──
+
+const PROJECT_COLUMNS: &str = "id, name, lifecycle, version, created_at, updated_at";
 
 #[derive(Debug, Clone)]
-pub struct PostgresProjectRepository {
-    database_url: DatabaseUrl,
+pub struct ProjectRepository {
+    store: Store,
 }
 
-impl PostgresProjectRepository {
+impl ProjectRepository {
     #[must_use]
-    pub const fn new(database_url: DatabaseUrl) -> Self {
-        Self { database_url }
+    pub const fn new(store: Store) -> Self {
+        Self { store }
     }
 
     /// Insert a validated project without rewriting caller-owned identity or history.
-    pub async fn create(&self, project: &Project) -> Result<(), StorageError> {
+    ///
+    /// # Errors
+    /// Returns an error when the project is invalid, already exists, or cannot be stored.
+    pub fn create(&self, project: &Project) -> Result<(), StorageError> {
+        const OPERATION: &str = "project create";
         revalidate(project)?;
         validate_timestamp_precision(project.created_at(), "created_at")?;
         validate_timestamp_precision(project.updated_at(), "updated_at")?;
         let version = database_version(project.version())?;
-        let (client, schema) = connect_authority(&self.database_url, "project create").await?;
-        let projects = schema.table("projects");
-        let lifecycle = lifecycle_text(project.lifecycle());
-        let result = client
-            .execute(
-                &format!(
-                    "INSERT INTO {projects} \
-                     (id, name, lifecycle, version, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6)"
-                ),
-                &[
-                    &project.id().as_uuid(),
-                    &project.name(),
-                    &lifecycle,
-                    &version,
-                    &project.created_at(),
-                    &project.updated_at(),
-                ],
-            )
-            .await;
+        let connection = self.store.conn()?;
+        let result = connection.execute(
+            &format!("INSERT INTO projects ({PROJECT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"),
+            params![
+                id_text(project.id().as_uuid()),
+                project.name(),
+                lifecycle_text(project.lifecycle()),
+                version,
+                timestamp_text(project.created_at()),
+                timestamp_text(project.updated_at()),
+            ],
+        );
         match result {
             Ok(1) => Ok(()),
             Ok(_) => Err(StorageError::Database {
-                operation: "project create",
+                operation: OPERATION,
             }),
-            Err(error) if error.code() == Some(&SqlState::UNIQUE_VIOLATION) => {
-                Err(StorageError::ProjectAlreadyExists {
-                    project_id: project.id(),
-                })
-            }
+            Err(error) if is_unique_violation(&error) => Err(StorageError::ProjectAlreadyExists {
+                project_id: project.id(),
+            }),
             Err(_) => Err(StorageError::Database {
-                operation: "project create",
+                operation: OPERATION,
             }),
         }
     }
 
-    pub async fn find(&self, project_id: ProjectId) -> Result<Option<Project>, StorageError> {
-        let (client, schema) = connect_authority(&self.database_url, "project find").await?;
-        let projects = schema.table("projects");
-        client
-            .query_opt(
-                &format!(
-                    "SELECT id, name, lifecycle, version, created_at, updated_at \
-                 FROM {projects} WHERE id = $1"
-                ),
-                &[&project_id.as_uuid()],
+    /// Find one project by identity.
+    ///
+    /// # Errors
+    /// Returns an error when the store cannot be read or holds invalid project data.
+    pub fn find(&self, project_id: ProjectId) -> Result<Option<Project>, StorageError> {
+        const OPERATION: &str = "project find";
+        let connection = self.store.conn()?;
+        connection
+            .query_row(
+                &format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"),
+                params![id_text(project_id.as_uuid())],
+                |row| Ok(project_from_row(row)),
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "project find",
-            })?
-            .as_ref()
-            .map(project_from_row)
+            .optional()
+            .map_err(database(OPERATION))?
             .transpose()
     }
 
     /// List every project in deterministic ID order without changing authority.
-    pub async fn list(&self) -> Result<Vec<Project>, StorageError> {
-        let (client, schema) = connect_authority(&self.database_url, "project list").await?;
-        let projects = schema.table("projects");
-        let rows = client
-            .query(
-                &format!(
-                    "SELECT id, name, lifecycle, version, created_at, updated_at \
-                 FROM {projects} ORDER BY id"
-                ),
-                &[],
-            )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "project list",
-            })?;
-        rows.iter().map(project_from_row).collect()
+    ///
+    /// # Errors
+    /// Returns an error when the store cannot be read or holds invalid project data.
+    pub fn list(&self) -> Result<Vec<Project>, StorageError> {
+        const OPERATION: &str = "project list";
+        let connection = self.store.conn()?;
+        read_projects(&connection, OPERATION)
     }
 
-    /// Replace one project under a row lock and caller-supplied optimistic version.
-    /// Lifecycle validity is checked before the write and before future dependent checks.
-    pub async fn replace(
-        &self,
-        expected: Version,
-        replacement: &Project,
-    ) -> Result<(), StorageError> {
+    /// Replace one project under an immediate transaction and the caller's optimistic version.
+    ///
+    /// # Errors
+    /// Returns an error when the replacement is invalid, the project is missing, or the
+    /// stored version is not the expected one.
+    pub fn replace(&self, expected: Version, replacement: &Project) -> Result<(), StorageError> {
+        const OPERATION: &str = "project replace";
         revalidate(replacement)?;
-        let (mut client, schema) = connect_authority(&self.database_url, "project replace").await?;
-        let projects = schema.table("projects");
-        let transaction = client
-            .transaction()
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "project replace",
-            })?;
-        let row = transaction
-            .query_opt(
-                &format!(
-                    "SELECT id, name, lifecycle, version, created_at, updated_at \
-                 FROM {projects} WHERE id = $1 FOR UPDATE"
-                ),
-                &[&replacement.id().as_uuid()],
+        let mut connection = self.store.conn()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database(OPERATION))?;
+        let current = transaction
+            .query_row(
+                &format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE id = ?1"),
+                params![id_text(replacement.id().as_uuid())],
+                |row| Ok(project_from_row(row)),
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "project replace",
-            })?
+            .optional()
+            .map_err(database(OPERATION))?
             .ok_or(StorageError::ProjectNotFound {
                 project_id: replacement.id(),
-            })?;
-        let current = project_from_row(&row)?;
+            })??;
         if current.version() != expected {
             return Err(StorageError::VersionConflict {
                 project_id: replacement.id(),
@@ -1118,151 +646,147 @@ impl PostgresProjectRepository {
                 reason: "updated_at must not move backward",
             });
         }
-        let version = database_version(replacement.version())?;
-        let lifecycle = lifecycle_text(replacement.lifecycle());
         let changed = transaction
             .execute(
-                &format!("UPDATE {projects} SET name = $1, lifecycle = $2, version = $3, updated_at = $4 \
-                 WHERE id = $5 AND version = $6"),
-                &[
-                    &replacement.name(),
-                    &lifecycle,
-                    &version,
-                    &replacement.updated_at(),
-                    &replacement.id().as_uuid(),
-                    &database_version(expected)?,
+                "UPDATE projects SET name = ?1, lifecycle = ?2, version = ?3, updated_at = ?4 \
+                 WHERE id = ?5 AND version = ?6",
+                params![
+                    replacement.name(),
+                    lifecycle_text(replacement.lifecycle()),
+                    database_version(replacement.version())?,
+                    timestamp_text(replacement.updated_at()),
+                    id_text(replacement.id().as_uuid()),
+                    database_version(expected)?,
                 ],
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "project replace",
-            })?;
+            .map_err(database(OPERATION))?;
         if changed != 1 {
             return Err(StorageError::Database {
-                operation: "project replace",
+                operation: OPERATION,
             });
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "project replace",
-            })
+        transaction.commit().map_err(database(OPERATION))
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PostgresTagRepository {
-    database_url: DatabaseUrl,
+fn read_projects(
+    connection: &Connection,
+    operation: &'static str,
+) -> Result<Vec<Project>, StorageError> {
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT {PROJECT_COLUMNS} FROM projects ORDER BY id"
+        ))
+        .map_err(database(operation))?;
+    let mut rows = statement.query([]).map_err(database(operation))?;
+    let mut projects = Vec::new();
+    while let Some(row) = rows.next().map_err(database(operation))? {
+        projects.push(project_from_row(row)?);
+    }
+    Ok(projects)
 }
 
-impl PostgresTagRepository {
+// ── Tags ──
+
+const TAG_COLUMNS: &str = "id, name, version, created_at, updated_at";
+
+#[derive(Debug, Clone)]
+pub struct TagRepository {
+    store: Store,
+}
+
+impl TagRepository {
     #[must_use]
-    pub const fn new(database_url: DatabaseUrl) -> Self {
-        Self { database_url }
+    pub const fn new(store: Store) -> Self {
+        Self { store }
     }
 
     /// Insert a validated tag without rewriting caller-owned identity or history.
-    pub async fn create(&self, tag: &Tag) -> Result<(), StorageError> {
+    ///
+    /// # Errors
+    /// Returns an error when the tag is invalid, already exists, or cannot be stored.
+    pub fn create(&self, tag: &Tag) -> Result<(), StorageError> {
+        const OPERATION: &str = "tag create";
         revalidate_tag(tag)?;
         validate_timestamp_precision(tag.created_at(), "created_at")?;
         validate_timestamp_precision(tag.updated_at(), "updated_at")?;
         let version = tag_creation_database_version(tag.version())?;
-        let (client, schema) = connect_authority(&self.database_url, "tag create").await?;
-        let tags = schema.table("tags");
-        let result = client
-            .execute(
-                &format!(
-                    "INSERT INTO {tags} (id, name, version, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5)"
-                ),
-                &[
-                    &tag.id().as_uuid(),
-                    &tag.name(),
-                    &version,
-                    &tag.created_at(),
-                    &tag.updated_at(),
-                ],
-            )
-            .await;
+        let connection = self.store.conn()?;
+        let result = connection.execute(
+            &format!("INSERT INTO tags ({TAG_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5)"),
+            params![
+                id_text(tag.id().as_uuid()),
+                tag.name(),
+                version,
+                timestamp_text(tag.created_at()),
+                timestamp_text(tag.updated_at()),
+            ],
+        );
         match result {
             Ok(1) => Ok(()),
             Ok(_) => Err(StorageError::Database {
-                operation: "tag create",
+                operation: OPERATION,
             }),
-            Err(error) if error.code() == Some(&SqlState::UNIQUE_VIOLATION) => {
+            Err(error) if is_unique_violation(&error) => {
                 Err(StorageError::TagAlreadyExists { tag_id: tag.id() })
             }
             Err(_) => Err(StorageError::Database {
-                operation: "tag create",
+                operation: OPERATION,
             }),
         }
     }
 
-    pub async fn find(&self, tag_id: TagId) -> Result<Option<Tag>, StorageError> {
-        let (client, schema) = connect_authority(&self.database_url, "tag find").await?;
-        let tags = schema.table("tags");
-        client
-            .query_opt(
-                &format!(
-                    "SELECT id, name, version, created_at, updated_at FROM {tags} WHERE id = $1"
-                ),
-                &[&tag_id.as_uuid()],
+    /// Find one tag by identity.
+    ///
+    /// # Errors
+    /// Returns an error when the store cannot be read or holds invalid tag data.
+    pub fn find(&self, tag_id: TagId) -> Result<Option<Tag>, StorageError> {
+        const OPERATION: &str = "tag find";
+        let connection = self.store.conn()?;
+        connection
+            .query_row(
+                &format!("SELECT {TAG_COLUMNS} FROM tags WHERE id = ?1"),
+                params![id_text(tag_id.as_uuid())],
+                |row| Ok(tag_from_row(row)),
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "tag find",
-            })?
-            .as_ref()
-            .map(tag_from_row)
+            .optional()
+            .map_err(database(OPERATION))?
             .transpose()
     }
 
     /// List every tag in deterministic ID order without changing authority.
-    pub async fn list(&self) -> Result<Vec<Tag>, StorageError> {
-        let (client, schema) = connect_authority(&self.database_url, "tag list").await?;
-        let tags = schema.table("tags");
-        let rows = client
-            .query(
-                &format!(
-                    "SELECT id, name, version, created_at, updated_at FROM {tags} ORDER BY id"
-                ),
-                &[],
-            )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "tag list",
-            })?;
-        rows.iter().map(tag_from_row).collect()
+    ///
+    /// # Errors
+    /// Returns an error when the store cannot be read or holds invalid tag data.
+    pub fn list(&self) -> Result<Vec<Tag>, StorageError> {
+        const OPERATION: &str = "tag list";
+        let connection = self.store.conn()?;
+        read_tags(&connection, OPERATION)
     }
 
-    /// Replace one tag under a row lock and caller-supplied optimistic version.
-    pub async fn replace(&self, expected: Version, replacement: &Tag) -> Result<(), StorageError> {
+    /// Replace one tag under an immediate transaction and the caller's optimistic version.
+    ///
+    /// # Errors
+    /// Returns an error when the replacement is invalid, the tag is missing, or the
+    /// stored version is not the expected one.
+    pub fn replace(&self, expected: Version, replacement: &Tag) -> Result<(), StorageError> {
+        const OPERATION: &str = "tag replace";
         revalidate_tag(replacement)?;
-        let (mut client, schema) = connect_authority(&self.database_url, "tag replace").await?;
-        let tags = schema.table("tags");
-        let transaction = client
-            .transaction()
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "tag replace",
-            })?;
-        let row = transaction
-            .query_opt(
-                &format!(
-                    "SELECT id, name, version, created_at, updated_at \
-                 FROM {tags} WHERE id = $1 FOR UPDATE"
-                ),
-                &[&replacement.id().as_uuid()],
+        let mut connection = self.store.conn()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database(OPERATION))?;
+        let current = transaction
+            .query_row(
+                &format!("SELECT {TAG_COLUMNS} FROM tags WHERE id = ?1"),
+                params![id_text(replacement.id().as_uuid())],
+                |row| Ok(tag_from_row(row)),
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "tag replace",
-            })?
+            .optional()
+            .map_err(database(OPERATION))?
             .ok_or(StorageError::TagNotFound {
                 tag_id: replacement.id(),
-            })?;
-        let current = tag_from_row(&row)?;
+            })??;
         if current.version() != expected {
             return Err(StorageError::TagVersionConflict {
                 tag_id: replacement.id(),
@@ -1289,189 +813,169 @@ impl PostgresTagRepository {
         }
         let changed = transaction
             .execute(
-                &format!(
-                    "UPDATE {tags} SET name = $1, version = $2, updated_at = $3 \
-                 WHERE id = $4 AND version = $5"
-                ),
-                &[
-                    &replacement.name(),
-                    &tag_database_version(replacement.version())?,
-                    &replacement.updated_at(),
-                    &replacement.id().as_uuid(),
-                    &tag_database_version(expected)?,
+                "UPDATE tags SET name = ?1, version = ?2, updated_at = ?3 \
+                 WHERE id = ?4 AND version = ?5",
+                params![
+                    replacement.name(),
+                    tag_database_version(replacement.version())?,
+                    timestamp_text(replacement.updated_at()),
+                    id_text(replacement.id().as_uuid()),
+                    tag_database_version(expected)?,
                 ],
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "tag replace",
-            })?;
+            .map_err(database(OPERATION))?;
         if changed != 1 {
             return Err(StorageError::Database {
-                operation: "tag replace",
+                operation: OPERATION,
             });
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "tag replace",
-            })
+        transaction.commit().map_err(database(OPERATION))
     }
 }
 
-/// PostgreSQL authority for core todo state. Relationship, recurrence, and reminder
-/// fields are rejected until their own append-only migrations define those contracts.
+fn read_tags(connection: &Connection, operation: &'static str) -> Result<Vec<Tag>, StorageError> {
+    let mut statement = connection
+        .prepare(&format!("SELECT {TAG_COLUMNS} FROM tags ORDER BY id"))
+        .map_err(database(operation))?;
+    let mut rows = statement.query([]).map_err(database(operation))?;
+    let mut tags = Vec::new();
+    while let Some(row) = rows.next().map_err(database(operation))? {
+        tags.push(tag_from_row(row)?);
+    }
+    Ok(tags)
+}
+
+// ── Todos ──
+
+const TODO_COLUMNS: &str = "id, title, project_id, lifecycle, version, created_at, updated_at, \
+     completed_at, trashed_at, due_date, due_at, due_timezone";
+
+/// Authority for core todo state. Relationship, recurrence, and reminder fields are
+/// rejected on replacement until those contracts join the todo aggregate.
 #[derive(Debug, Clone)]
-pub struct PostgresTodoRepository {
-    database_url: DatabaseUrl,
+pub struct TodoRepository {
+    store: Store,
 }
 
-impl PostgresTodoRepository {
+impl TodoRepository {
     #[must_use]
-    pub const fn new(database_url: DatabaseUrl) -> Self {
-        Self { database_url }
+    pub const fn new(store: Store) -> Self {
+        Self { store }
     }
 
-    pub async fn create(&self, todo: &Todo) -> Result<(), StorageError> {
+    /// Insert a validated todo, its relationships, and its due value together.
+    ///
+    /// # Errors
+    /// Returns an error when the todo is invalid, already exists, names a missing
+    /// project or relationship, or cannot be stored.
+    pub fn create(&self, todo: &Todo) -> Result<(), StorageError> {
+        const OPERATION: &str = "todo create";
         revalidate_todo(todo)?;
-
         validate_timestamp_precision(todo.created_at(), "created_at")?;
         validate_timestamp_precision(todo.updated_at(), "updated_at")?;
         let version = todo_creation_database_version(todo.version())?;
-        let (mut client, schema) = connect_authority(&self.database_url, "todo create").await?;
-        let transaction = client
-            .transaction()
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "todo create",
-            })?;
-        validate_todo_project(&transaction, &schema, todo.project_id()).await?;
-        validate_todo_relationships(&transaction, &schema, todo).await?;
-        let todos = schema.table("todos");
-        let lifecycle = lifecycle_text(todo.lifecycle());
+        let mut connection = self.store.conn()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database(OPERATION))?;
+        validate_todo_project(&transaction, todo.project_id())?;
+        validate_todo_relationships(&transaction, todo)?;
         let due = DueColumns::from(todo.due());
-        let result = transaction
-            .execute(
-                &format!(
-                    "INSERT INTO {todos} \
-                     (id, title, project_id, lifecycle, version, created_at, updated_at, \
-                     completed_at, trashed_at, due_date, due_at, due_timezone) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)"
-                ),
-                &[
-                    &todo.id().as_uuid(),
-                    &todo.title(),
-                    &todo.project_id().map(ProjectId::as_uuid),
-                    &lifecycle,
-                    &version,
-                    &todo.created_at(),
-                    &todo.updated_at(),
-                    &todo.completed_at(),
-                    &todo.trashed_at(),
-                    &due.date,
-                    &due.at,
-                    &due.timezone,
-                ],
-            )
-            .await;
+        let result = transaction.execute(
+            &format!(
+                "INSERT INTO todos ({TODO_COLUMNS}) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+            ),
+            params![
+                id_text(todo.id().as_uuid()),
+                todo.title(),
+                todo.project_id().map(|id| id_text(id.as_uuid())),
+                lifecycle_text(todo.lifecycle()),
+                version,
+                timestamp_text(todo.created_at()),
+                timestamp_text(todo.updated_at()),
+                todo.completed_at().map(timestamp_text),
+                todo.trashed_at().map(timestamp_text),
+                due.date,
+                due.at,
+                due.timezone,
+            ],
+        );
         match result {
             Ok(1) => {
-                persist_todo_relationships(&transaction, &schema, todo).await?;
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|_| StorageError::Database {
-                        operation: "todo create",
-                    })
+                persist_todo_relationships(&transaction, todo)?;
+                transaction.commit().map_err(database(OPERATION))
             }
             Ok(_) => Err(StorageError::Database {
-                operation: "todo create",
+                operation: OPERATION,
             }),
-            Err(error) if error.code() == Some(&SqlState::UNIQUE_VIOLATION) => {
+            Err(error) if is_unique_violation(&error) => {
                 Err(StorageError::TodoAlreadyExists { todo_id: todo.id() })
             }
             Err(_) => Err(StorageError::Database {
-                operation: "todo create",
+                operation: OPERATION,
             }),
         }
     }
 
-    pub async fn find(&self, todo_id: TodoId) -> Result<Option<Todo>, StorageError> {
-        let (client, schema) = connect_authority(&self.database_url, "todo find").await?;
-        let todos = schema.table("todos");
-        let row = client
-            .query_opt(
-                &format!(
-                    "SELECT id, title, project_id, lifecycle, version, created_at, updated_at, \
-                     completed_at, trashed_at, due_date, due_at, due_timezone FROM {todos} WHERE id = $1"
-                ),
-                &[&todo_id.as_uuid()],
+    /// Find one todo, with the relationships stored alongside it.
+    ///
+    /// # Errors
+    /// Returns an error when the store cannot be read or holds invalid todo data.
+    pub fn find(&self, todo_id: TodoId) -> Result<Option<Todo>, StorageError> {
+        const OPERATION: &str = "todo find";
+        let connection = self.store.conn()?;
+        let todo = connection
+            .query_row(
+                &format!("SELECT {TODO_COLUMNS} FROM todos WHERE id = ?1"),
+                params![id_text(todo_id.as_uuid())],
+                |row| Ok(todo_from_row(row)),
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "todo find",
-            })?;
-        let todo = row.as_ref().map(todo_from_row).transpose()?;
+            .optional()
+            .map_err(database(OPERATION))?
+            .transpose()?;
         match todo {
-            Some(todo) => load_todo_relationships(&client, &schema, todo)
-                .await
-                .map(Some),
+            Some(todo) => load_todo_relationships(&connection, todo).map(Some),
             None => Ok(None),
         }
     }
 
     /// List core todos in deterministic ID order.
-    pub async fn list(&self) -> Result<Vec<Todo>, StorageError> {
-        let (client, schema) = connect_authority(&self.database_url, "todo list").await?;
-        let todos = schema.table("todos");
-        let rows = client
-            .query(
-                &format!(
-                    "SELECT id, title, project_id, lifecycle, version, created_at, updated_at, \
-                     completed_at, trashed_at, due_date, due_at, due_timezone FROM {todos} ORDER BY id"
-                ),
-                &[],
-            )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "todo list",
-            })?;
-        let mut result = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let todo = todo_from_row(row)?;
-            result.push(load_todo_relationships(&client, &schema, todo).await?);
-        }
-        Ok(result)
+    ///
+    /// # Errors
+    /// Returns an error when the store cannot be read or holds invalid todo data.
+    pub fn list(&self) -> Result<Vec<Todo>, StorageError> {
+        const OPERATION: &str = "todo list";
+        let connection = self.store.conn()?;
+        read_todos(&connection, OPERATION)
     }
 
-    pub async fn replace(&self, expected: Version, replacement: &Todo) -> Result<(), StorageError> {
+    /// Replace one todo under an immediate transaction and the caller's optimistic version.
+    ///
+    /// # Errors
+    /// Returns an error when the replacement is invalid, the todo is missing, or the
+    /// stored version is not the expected one.
+    pub fn replace(&self, expected: Version, replacement: &Todo) -> Result<(), StorageError> {
+        const OPERATION: &str = "todo replace";
         revalidate_todo(replacement)?;
         validate_todo_foundation(replacement)
             .map_err(|reason| StorageError::InvalidTodoReplacement { reason })?;
-        let (mut client, schema) = connect_authority(&self.database_url, "todo replace").await?;
-        let transaction = client
-            .transaction()
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "todo replace",
-            })?;
-        let todos = schema.table("todos");
-        let row = transaction
-            .query_opt(
-                &format!(
-                    "SELECT id, title, project_id, lifecycle, version, created_at, updated_at, \
-                     completed_at, trashed_at, due_date, due_at, due_timezone FROM {todos} WHERE id = $1 FOR UPDATE"
-                ),
-                &[&replacement.id().as_uuid()],
+        let mut connection = self.store.conn()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database(OPERATION))?;
+        let stored = transaction
+            .query_row(
+                &format!("SELECT {TODO_COLUMNS} FROM todos WHERE id = ?1"),
+                params![id_text(replacement.id().as_uuid())],
+                |row| Ok(todo_from_row(row)),
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "todo replace",
-            })?
+            .optional()
+            .map_err(database(OPERATION))?
             .ok_or(StorageError::TodoNotFound {
                 todo_id: replacement.id(),
-            })?;
-        let current = load_todo_relationships(&transaction, &schema, todo_from_row(&row)?).await?;
+            })??;
+        let current = load_todo_relationships(&transaction, stored)?;
         if current.version() != expected {
             return Err(StorageError::TodoVersionConflict {
                 todo_id: replacement.id(),
@@ -1497,84 +1001,83 @@ impl PostgresTodoRepository {
                 reason: "updated_at must not move backward",
             });
         }
-        validate_todo_project(&transaction, &schema, replacement.project_id()).await?;
-        validate_todo_relationships(&transaction, &schema, replacement).await?;
-        let lifecycle = lifecycle_text(replacement.lifecycle());
+        validate_todo_project(&transaction, replacement.project_id())?;
+        validate_todo_relationships(&transaction, replacement)?;
         let due = DueColumns::from(replacement.due());
         let changed = transaction
             .execute(
-                &format!(
-                    "UPDATE {todos} SET title = $1, project_id = $2, lifecycle = $3, \
-                     version = $4, updated_at = $5, completed_at = $6, trashed_at = $7, \
-                     due_date = $8, due_at = $9, due_timezone = $10 \
-                     WHERE id = $11 AND version = $12"
-                ),
-                &[
-                    &replacement.title(),
-                    &replacement.project_id().map(ProjectId::as_uuid),
-                    &lifecycle,
-                    &todo_database_version(replacement.version())?,
-                    &replacement.updated_at(),
-                    &replacement.completed_at(),
-                    &replacement.trashed_at(),
-                    &due.date,
-                    &due.at,
-                    &due.timezone,
-                    &replacement.id().as_uuid(),
-                    &todo_database_version(expected)?,
+                "UPDATE todos SET title = ?1, project_id = ?2, lifecycle = ?3, version = ?4, \
+                 updated_at = ?5, completed_at = ?6, trashed_at = ?7, due_date = ?8, \
+                 due_at = ?9, due_timezone = ?10 WHERE id = ?11 AND version = ?12",
+                params![
+                    replacement.title(),
+                    replacement.project_id().map(|id| id_text(id.as_uuid())),
+                    lifecycle_text(replacement.lifecycle()),
+                    todo_database_version(replacement.version())?,
+                    timestamp_text(replacement.updated_at()),
+                    replacement.completed_at().map(timestamp_text),
+                    replacement.trashed_at().map(timestamp_text),
+                    due.date,
+                    due.at,
+                    due.timezone,
+                    id_text(replacement.id().as_uuid()),
+                    todo_database_version(expected)?,
                 ],
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "todo replace",
-            })?;
+            .map_err(database(OPERATION))?;
         if changed != 1 {
             return Err(StorageError::Database {
-                operation: "todo replace",
+                operation: OPERATION,
             });
         }
-        persist_todo_relationships(&transaction, &schema, replacement).await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "todo replace",
-            })
+        persist_todo_relationships(&transaction, replacement)?;
+        transaction.commit().map_err(database(OPERATION))
     }
 }
 
-async fn validate_todo_relationships<C: GenericClient + Sync>(
-    client: &C,
-    schema: &AuthoritySchema,
-    todo: &Todo,
-) -> Result<(), StorageError> {
-    let todos = schema.table("todos");
-    let tags = schema.table("tags");
-    let parents = schema.table("todo_parents");
-    let dependencies = schema.table("todo_dependencies");
+fn read_todos(connection: &Connection, operation: &'static str) -> Result<Vec<Todo>, StorageError> {
+    let mut statement = connection
+        .prepare(&format!("SELECT {TODO_COLUMNS} FROM todos ORDER BY id"))
+        .map_err(database(operation))?;
+    let mut rows = statement.query([]).map_err(database(operation))?;
+    let mut stored = Vec::new();
+    while let Some(row) = rows.next().map_err(database(operation))? {
+        stored.push(todo_from_row(row)?);
+    }
+    stored
+        .into_iter()
+        .map(|todo| load_todo_relationships(connection, todo))
+        .collect()
+}
+
+// ── Todo relationships ──
+
+// Every named parent, dependency, and tag must exist, and no edge may close a cycle
+fn validate_todo_relationships(connection: &Connection, todo: &Todo) -> Result<(), StorageError> {
+    const PARENT_OPERATION: &str = "todo parent validation";
+    const DEPENDENCY_OPERATION: &str = "todo dependency validation";
+    const TAG_OPERATION: &str = "todo tag validation";
     if let Some(parent) = todo.parent_id() {
         if parent == todo.id() {
             return Err(StorageError::TodoRelationshipConflict {
                 reason: "todo cannot be its own parent",
             });
         }
-        let exists: bool = client
-            .query_one(
-                &format!("SELECT EXISTS (SELECT 1 FROM {todos} WHERE id = $1)"),
-                &[&parent.as_uuid()],
-            )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "todo parent validation",
-            })?
-            .get(0);
-        if !exists {
+        if !todo_exists(connection, parent, PARENT_OPERATION)? {
             return Err(StorageError::TodoRelationshipConflict {
                 reason: "parent todo was not found",
             });
         }
-        let cycle: bool = client.query_one(&format!("WITH RECURSIVE ancestors(id) AS (SELECT $1::uuid UNION SELECT p.parent_id FROM {parents} p JOIN ancestors a ON p.child_id = a.id) SELECT EXISTS (SELECT 1 FROM ancestors WHERE id = $2)"), &[&parent.as_uuid(), &todo.id().as_uuid()]).await
-            .map_err(|_| StorageError::Database { operation: "todo parent validation" })?.get(0);
+        let cycle: bool = connection
+            .query_row(
+                "WITH RECURSIVE ancestors(id) AS (\
+                 SELECT ?1 UNION SELECT p.parent_id FROM todo_parents p \
+                 JOIN ancestors a ON p.child_id = a.id) \
+                 SELECT EXISTS (SELECT 1 FROM ancestors WHERE id = ?2)",
+                params![id_text(parent.as_uuid()), id_text(todo.id().as_uuid())],
+                |row| row.get(0),
+            )
+            .map_err(database(PARENT_OPERATION))?;
         if cycle {
             return Err(StorageError::TodoRelationshipConflict {
                 reason: "parent relationship would create a cycle",
@@ -1587,23 +1090,21 @@ async fn validate_todo_relationships<C: GenericClient + Sync>(
                 reason: "todo cannot depend on itself",
             });
         }
-        let exists: bool = client
-            .query_one(
-                &format!("SELECT EXISTS (SELECT 1 FROM {todos} WHERE id = $1)"),
-                &[&dependency.as_uuid()],
-            )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "todo dependency validation",
-            })?
-            .get(0);
-        if !exists {
+        if !todo_exists(connection, *dependency, DEPENDENCY_OPERATION)? {
             return Err(StorageError::TodoRelationshipConflict {
                 reason: "dependency todo was not found",
             });
         }
-        let cycle: bool = client.query_one(&format!("WITH RECURSIVE reach(id) AS (SELECT $1::uuid UNION SELECT d.prerequisite_id FROM {dependencies} d JOIN reach r ON d.dependent_id = r.id) SELECT EXISTS (SELECT 1 FROM reach WHERE id = $2)"), &[&dependency.as_uuid(), &todo.id().as_uuid()]).await
-            .map_err(|_| StorageError::Database { operation: "todo dependency validation" })?.get(0);
+        let cycle: bool = connection
+            .query_row(
+                "WITH RECURSIVE reach(id) AS (\
+                 SELECT ?1 UNION SELECT d.prerequisite_id FROM todo_dependencies d \
+                 JOIN reach r ON d.dependent_id = r.id) \
+                 SELECT EXISTS (SELECT 1 FROM reach WHERE id = ?2)",
+                params![id_text(dependency.as_uuid()), id_text(todo.id().as_uuid())],
+                |row| row.get(0),
+            )
+            .map_err(database(DEPENDENCY_OPERATION))?;
         if cycle {
             return Err(StorageError::TodoRelationshipConflict {
                 reason: "dependency relationship would create a cycle",
@@ -1611,16 +1112,13 @@ async fn validate_todo_relationships<C: GenericClient + Sync>(
         }
     }
     for tag in todo.tag_ids() {
-        let exists: bool = client
-            .query_one(
-                &format!("SELECT EXISTS (SELECT 1 FROM {tags} WHERE id = $1)"),
-                &[&tag.as_uuid()],
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM tags WHERE id = ?1)",
+                params![id_text(tag.as_uuid())],
+                |row| row.get(0),
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "todo tag validation",
-            })?
-            .get(0);
+            .map_err(database(TAG_OPERATION))?;
         if !exists {
             return Err(StorageError::TodoRelationshipConflict {
                 reason: "tag was not found",
@@ -1630,115 +1128,93 @@ async fn validate_todo_relationships<C: GenericClient + Sync>(
     Ok(())
 }
 
-async fn persist_todo_relationships<C: GenericClient + Sync>(
-    client: &C,
-    schema: &AuthoritySchema,
-    todo: &Todo,
-) -> Result<(), StorageError> {
-    let todo_id = todo.id().as_uuid();
-    let parents = schema.table("todo_parents");
-    let dependencies = schema.table("todo_dependencies");
-    let tags = schema.table("todo_tags");
-    client
-        .execute(
-            &format!("DELETE FROM {parents} WHERE child_id = $1"),
-            &[&todo_id],
+fn todo_exists(
+    connection: &Connection,
+    todo_id: TodoId,
+    operation: &'static str,
+) -> Result<bool, StorageError> {
+    connection
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM todos WHERE id = ?1)",
+            params![id_text(todo_id.as_uuid())],
+            |row| row.get(0),
         )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "todo relationship write",
-        })?;
-    client
-        .execute(
-            &format!("DELETE FROM {dependencies} WHERE dependent_id = $1"),
-            &[&todo_id],
-        )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "todo relationship write",
-        })?;
-    client
-        .execute(
-            &format!("DELETE FROM {tags} WHERE todo_id = $1"),
-            &[&todo_id],
-        )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "todo relationship write",
-        })?;
+        .map_err(database(operation))
+}
+
+// The stored edges are whatever the caller's todo says they are, replaced wholesale
+fn persist_todo_relationships(connection: &Connection, todo: &Todo) -> Result<(), StorageError> {
+    const OPERATION: &str = "todo relationship write";
+    let id = id_text(todo.id().as_uuid());
+    for statement in [
+        "DELETE FROM todo_parents WHERE child_id = ?1",
+        "DELETE FROM todo_dependencies WHERE dependent_id = ?1",
+        "DELETE FROM todo_tags WHERE todo_id = ?1",
+    ] {
+        connection
+            .execute(statement, params![id])
+            .map_err(database(OPERATION))?;
+    }
     if let Some(parent) = todo.parent_id() {
-        client
+        connection
             .execute(
-                &format!("INSERT INTO {parents} (child_id, parent_id) VALUES ($1, $2)"),
-                &[&todo_id, &parent.as_uuid()],
+                "INSERT INTO todo_parents (child_id, parent_id) VALUES (?1, ?2)",
+                params![id, id_text(parent.as_uuid())],
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "todo relationship write",
-            })?;
+            .map_err(database(OPERATION))?;
     }
     for dependency in todo.dependency_ids() {
-        client
+        connection
             .execute(
-                &format!(
-                    "INSERT INTO {dependencies} (dependent_id, prerequisite_id) VALUES ($1, $2)"
-                ),
-                &[&todo_id, &dependency.as_uuid()],
+                "INSERT INTO todo_dependencies (dependent_id, prerequisite_id) VALUES (?1, ?2)",
+                params![id, id_text(dependency.as_uuid())],
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "todo relationship write",
-            })?;
+            .map_err(database(OPERATION))?;
     }
     for tag in todo.tag_ids() {
-        client
+        connection
             .execute(
-                &format!("INSERT INTO {tags} (todo_id, tag_id) VALUES ($1, $2)"),
-                &[&todo_id, &tag.as_uuid()],
+                "INSERT INTO todo_tags (todo_id, tag_id) VALUES (?1, ?2)",
+                params![id, id_text(tag.as_uuid())],
             )
-            .await
-            .map_err(|_| StorageError::Database {
-                operation: "todo relationship write",
-            })?;
+            .map_err(database(OPERATION))?;
     }
     Ok(())
 }
 
-async fn load_todo_relationships<C: GenericClient + Sync>(
-    client: &C,
-    schema: &AuthoritySchema,
-    todo: Todo,
-) -> Result<Todo, StorageError> {
-    let id = todo.id().as_uuid();
-    let parent_table = schema.table("todo_parents");
-    let dependency_table = schema.table("todo_dependencies");
-    let tag_table = schema.table("todo_tags");
-    let parent = client
-        .query_opt(
-            &format!("SELECT parent_id FROM {parent_table} WHERE child_id = $1"),
-            &[&id],
+// A todo read back carries the edges the store holds, not the ones the row alone knows
+fn load_todo_relationships(connection: &Connection, todo: Todo) -> Result<Todo, StorageError> {
+    const OPERATION: &str = "todo relationship read";
+    let id = id_text(todo.id().as_uuid());
+    let parent = connection
+        .query_row(
+            "SELECT parent_id FROM todo_parents WHERE child_id = ?1",
+            params![id],
+            |row| row.get::<_, String>(0),
         )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "todo relationship read",
-        })?
-        .map(|row| TodoId::from_uuid(row.get(0)));
-    let dependencies = client.query(
-        &format!("SELECT prerequisite_id FROM {dependency_table} WHERE dependent_id = $1 ORDER BY prerequisite_id"), &[&id]
-    ).await.map_err(|_| StorageError::Database { operation: "todo relationship read" })?
-        .into_iter().map(|row| TodoId::from_uuid(row.get(0))).collect();
-    let tags = client
-        .query(
-            &format!("SELECT tag_id FROM {tag_table} WHERE todo_id = $1 ORDER BY tag_id"),
-            &[&id],
-        )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "todo relationship read",
-        })?
-        .into_iter()
-        .map(|row| TagId::from_uuid(row.get(0)))
-        .collect();
+        .optional()
+        .map_err(database(OPERATION))?
+        .map(|value| parse_id(&value).map(TodoId::from_uuid))
+        .transpose()?;
+    let dependencies = read_ids(
+        connection,
+        "SELECT prerequisite_id FROM todo_dependencies WHERE dependent_id = ?1 \
+         ORDER BY prerequisite_id",
+        &id,
+        OPERATION,
+    )?
+    .into_iter()
+    .map(TodoId::from_uuid)
+    .collect();
+    let tags = read_ids(
+        connection,
+        "SELECT tag_id FROM todo_tags WHERE todo_id = ?1 ORDER BY tag_id",
+        &id,
+        OPERATION,
+    )?
+    .into_iter()
+    .map(TagId::from_uuid)
+    .collect();
     Todo::new(
         todo.id(),
         todo.title().to_owned(),
@@ -1757,25 +1233,38 @@ async fn load_todo_relationships<C: GenericClient + Sync>(
     .map_err(StorageError::Domain)
 }
 
-async fn validate_todo_project<C: GenericClient + Sync>(
-    client: &C,
-    schema: &AuthoritySchema,
+fn read_ids(
+    connection: &Connection,
+    query: &str,
+    id: &str,
+    operation: &'static str,
+) -> Result<Vec<Uuid>, StorageError> {
+    let mut statement = connection.prepare(query).map_err(database(operation))?;
+    let rows = statement
+        .query_map(params![id], |row| row.get::<_, String>(0))
+        .map_err(database(operation))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(database(operation))?
+        .iter()
+        .map(|value| parse_id(value))
+        .collect()
+}
+
+fn validate_todo_project(
+    connection: &Connection,
     project_id: Option<ProjectId>,
 ) -> Result<(), StorageError> {
+    const OPERATION: &str = "todo project validation";
     let Some(project_id) = project_id else {
         return Ok(());
     };
-    let projects = schema.table("projects");
-    let exists: bool = client
-        .query_one(
-            &format!("SELECT EXISTS (SELECT 1 FROM {projects} WHERE id = $1)"),
-            &[&project_id.as_uuid()],
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM projects WHERE id = ?1)",
+            params![id_text(project_id.as_uuid())],
+            |row| row.get(0),
         )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "todo project validation",
-        })?
-        .get(0);
+        .map_err(database(OPERATION))?;
     if exists {
         Ok(())
     } else {
@@ -1793,6 +1282,513 @@ fn validate_todo_foundation(todo: &Todo) -> Result<(), &'static str> {
     if !todo.dependency_ids().is_empty() {
         return Err("dependency relationships are not enabled yet");
     }
+    Ok(())
+}
+
+// ── Reminders, deliveries, recurrence ──
+
+/// Persist a validated reminder.
+///
+/// # Errors
+/// Returns an error when the reminder is invalid or cannot be stored.
+pub fn create_reminder(store: &Store, reminder: &Reminder) -> Result<(), StorageError> {
+    const OPERATION: &str = "reminder create";
+    reminder.validate()?;
+    validate_timestamp_precision(reminder.remind_at, "remind_at")?;
+    validate_timestamp_precision(reminder.created_at, "created_at")?;
+    validate_timestamp_precision(reminder.updated_at, "updated_at")?;
+    let version = i64::try_from(reminder.version).map_err(|_| StorageError::Database {
+        operation: OPERATION,
+    })?;
+    let connection = store.conn()?;
+    let changed = connection
+        .execute(
+            "INSERT INTO todo_reminders \
+             (id, todo_id, remind_at, channel, lifecycle, version, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id_text(reminder.id.as_uuid()),
+                id_text(reminder.todo_id.as_uuid()),
+                timestamp_text(reminder.remind_at),
+                channel_text(reminder.channel),
+                reminder_lifecycle_text(reminder.lifecycle),
+                version,
+                timestamp_text(reminder.created_at),
+                timestamp_text(reminder.updated_at),
+            ],
+        )
+        .map_err(database(OPERATION))?;
+    if changed != 1 {
+        return Err(StorageError::Database {
+            operation: OPERATION,
+        });
+    }
+    Ok(())
+}
+
+/// Persist a pending, sent, or failed delivery record.
+///
+/// # Errors
+/// Returns an error when the record is invalid or cannot be stored.
+pub fn create_delivery_record(store: &Store, record: &DeliveryRecord) -> Result<(), StorageError> {
+    const OPERATION: &str = "delivery create";
+    record.validate()?;
+    validate_timestamp_precision(record.created_at, "created_at")?;
+    if let Some(attempted_at) = record.attempted_at {
+        validate_timestamp_precision(attempted_at, "attempted_at")?;
+    }
+    let connection = store.conn()?;
+    let changed = connection
+        .execute(
+            "INSERT INTO todo_reminder_deliveries \
+             (id, reminder_id, idempotency_key, status, attempted_at, provider_reference, \
+             failure_code, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id_text(record.id.as_uuid()),
+                id_text(record.reminder_id.as_uuid()),
+                record.idempotency_key,
+                delivery_status_text(record.status),
+                record.attempted_at.map(timestamp_text),
+                record.provider_reference,
+                record.failure_code,
+                timestamp_text(record.created_at),
+            ],
+        )
+        .map_err(database(OPERATION))?;
+    if changed != 1 {
+        return Err(StorageError::Database {
+            operation: OPERATION,
+        });
+    }
+    Ok(())
+}
+
+/// Replace the bounded recurrence rule for one authoritative todo.
+///
+/// # Errors
+/// Returns an error when the rule is invalid, the todo is missing, or the write fails.
+pub fn set_todo_recurrence(
+    store: &Store,
+    todo_id: TodoId,
+    start: NaiveDate,
+    rule: &Rule,
+) -> Result<(), StorageError> {
+    const OPERATION: &str = "recurrence set";
+    rule.validate(start)?;
+    let mut connection = store.conn()?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database(OPERATION))?;
+    if !todo_exists(&transaction, todo_id, OPERATION)? {
+        return Err(StorageError::InvalidStoredTodoData);
+    }
+    transaction
+        .execute(
+            "INSERT INTO todo_recurrence \
+             (todo_id, start_date, frequency, interval, occurrence_count, until_date) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (todo_id) DO UPDATE SET start_date = excluded.start_date, \
+             frequency = excluded.frequency, interval = excluded.interval, \
+             occurrence_count = excluded.occurrence_count, until_date = excluded.until_date",
+            params![
+                id_text(todo_id.as_uuid()),
+                date_text(start),
+                frequency_text(rule.frequency),
+                i64::from(rule.interval),
+                rule.count.map(i64::from),
+                rule.until.map(date_text),
+            ],
+        )
+        .map_err(database(OPERATION))?;
+    transaction.commit().map_err(database(OPERATION))
+}
+
+/// Read the authoritative recurrence rule for one todo.
+///
+/// # Errors
+/// Returns an error when the store cannot be read or holds an invalid rule.
+pub fn find_todo_recurrence(
+    store: &Store,
+    todo_id: TodoId,
+) -> Result<Option<(NaiveDate, Rule)>, StorageError> {
+    const OPERATION: &str = "recurrence find";
+    let connection = store.conn()?;
+    let row = connection
+        .query_row(
+            "SELECT start_date, frequency, interval, occurrence_count, until_date \
+             FROM todo_recurrence WHERE todo_id = ?1",
+            params![id_text(todo_id.as_uuid())],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(database(OPERATION))?;
+    let Some((start, frequency, interval, count, until)) = row else {
+        return Ok(None);
+    };
+    let start = parse_date(&start)?;
+    let frequency = match frequency.as_str() {
+        FREQUENCY_DAILY => Frequency::Daily,
+        FREQUENCY_WEEKLY => Frequency::Weekly,
+        FREQUENCY_MONTHLY => Frequency::Monthly,
+        _ => return Err(StorageError::InvalidStoredTodoData),
+    };
+    let interval = u32::try_from(interval).map_err(|_| StorageError::InvalidStoredTodoData)?;
+    let count = count
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| StorageError::InvalidStoredTodoData)?;
+    let until = until.as_deref().map(parse_date).transpose()?;
+    let rule = Rule::new(frequency, interval, count, until, start)?;
+    Ok(Some((start, rule)))
+}
+
+// ── Export ──
+
+/// Read the complete currently representable authority in one transaction.
+///
+/// Relationship, recurrence, and reminder rows are not fabricated here; each must be
+/// added to the export contract with its own migration and tests.
+///
+/// # Errors
+/// Returns an error when the store cannot be read or holds invalid data.
+pub fn export_authority(store: &Store) -> Result<AuthorityExport, StorageError> {
+    const OPERATION: &str = "interop export";
+    let mut connection = store.conn()?;
+    // One transaction, so the revision and the rows it counts are the same instant
+    let transaction = connection.transaction().map_err(database(OPERATION))?;
+    let projects = read_projects(&transaction, OPERATION)?;
+    let tags = read_tags(&transaction, OPERATION)?;
+    let todos = read_todos(&transaction, OPERATION)?;
+    let revision: i64 = transaction
+        .query_row(
+            "SELECT revision FROM mg_remindr_authority_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database(OPERATION))?
+        .ok_or(StorageError::Database {
+            operation: OPERATION,
+        })?;
+    let revision = u64::try_from(revision).map_err(|_| StorageError::Database {
+        operation: OPERATION,
+    })?;
+    transaction.commit().map_err(database(OPERATION))?;
+    Ok(AuthorityExport {
+        projects,
+        tags,
+        todos,
+        revision,
+    })
+}
+
+/// Raise the authority checkpoint to at least `revision`, leaving it alone otherwise.
+///
+/// Used when rows arrive from somewhere the triggers never saw, so a consumer that
+/// remembers the last revision it read is never handed a lower one.
+///
+/// # Errors
+/// Returns an error when the checkpoint cannot be written.
+pub fn raise_authority_revision(store: &Store, revision: u64) -> Result<u64, StorageError> {
+    const OPERATION: &str = "authority revision";
+    let wanted = i64::try_from(revision).map_err(|_| StorageError::Database {
+        operation: OPERATION,
+    })?;
+    let mut connection = store.conn()?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(database(OPERATION))?;
+    transaction
+        .execute(
+            "UPDATE mg_remindr_authority_state SET revision = ?1, changed_at = ?2 \
+             WHERE singleton = 1 AND revision < ?1",
+            params![wanted, timestamp_text(Utc::now())],
+        )
+        .map_err(database(OPERATION))?;
+    let current: i64 = transaction
+        .query_row(
+            "SELECT revision FROM mg_remindr_authority_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database(OPERATION))?;
+    transaction.commit().map_err(database(OPERATION))?;
+    u64::try_from(current).map_err(|_| StorageError::Database {
+        operation: OPERATION,
+    })
+}
+
+// ── Rows in, rows out ──
+
+/// The three nullable columns one due value occupies.
+struct DueColumns {
+    date: Option<String>,
+    at: Option<String>,
+    timezone: Option<String>,
+}
+
+impl From<Option<&TodoDue>> for DueColumns {
+    fn from(due: Option<&TodoDue>) -> Self {
+        match due {
+            None => Self {
+                date: None,
+                at: None,
+                timezone: None,
+            },
+            Some(TodoDue::Date { date, timezone }) => Self {
+                date: Some(date_text(*date)),
+                at: None,
+                timezone: Some(timezone.clone()),
+            },
+            Some(TodoDue::Timed { at, timezone }) => Self {
+                date: None,
+                at: Some(timestamp_text(at.with_timezone(&Utc))),
+                timezone: Some(timezone.clone()),
+            },
+        }
+    }
+}
+
+// The stored instant is reprojected into its own zone, so the exported offset is the zone's
+fn due_from_row(row: &Row<'_>) -> Result<Option<TodoDue>, StorageError> {
+    let date = column_text(row, 9)?;
+    let at = column_text(row, 10)?;
+    let timezone = column_text(row, 11)?;
+    match (date, at, timezone) {
+        (None, None, None) => Ok(None),
+        (Some(date), None, Some(timezone)) => TodoDue::date(parse_date(&date)?, timezone)
+            .map(Some)
+            .map_err(|_| StorageError::InvalidStoredTodoData),
+        (None, Some(at), Some(timezone)) => {
+            let zone = timezone
+                .parse::<Tz>()
+                .map_err(|_| StorageError::InvalidStoredTodoData)?;
+            let zoned = parse_timestamp(&at)?.with_timezone(&zone);
+            TodoDue::timed(zoned.fixed_offset(), timezone)
+                .map(Some)
+                .map_err(|_| StorageError::InvalidStoredTodoData)
+        }
+        _ => Err(StorageError::InvalidStoredTodoData),
+    }
+}
+
+fn project_from_row(row: &Row<'_>) -> Result<Project, StorageError> {
+    let lifecycle = parse_lifecycle(&required_text(row, 2, StorageError::InvalidStoredData)?)
+        .ok_or(StorageError::InvalidStoredData)?;
+    Project::new(
+        ProjectId::from_uuid(parse_id(&required_text(
+            row,
+            0,
+            StorageError::InvalidStoredData,
+        )?)?),
+        required_text(row, 1, StorageError::InvalidStoredData)?,
+        lifecycle,
+        parse_version(row, 3, StorageError::InvalidStoredData)?,
+        parse_timestamp(&required_text(row, 4, StorageError::InvalidStoredData)?)?,
+        parse_timestamp(&required_text(row, 5, StorageError::InvalidStoredData)?)?,
+    )
+    .map_err(|_| StorageError::InvalidStoredData)
+}
+
+fn tag_from_row(row: &Row<'_>) -> Result<Tag, StorageError> {
+    Tag::new(
+        TagId::from_uuid(parse_id(&required_text(
+            row,
+            0,
+            StorageError::InvalidStoredTagData,
+        )?)?),
+        required_text(row, 1, StorageError::InvalidStoredTagData)?,
+        parse_version(row, 2, StorageError::InvalidStoredTagData)?,
+        parse_timestamp(&required_text(row, 3, StorageError::InvalidStoredTagData)?)?,
+        parse_timestamp(&required_text(row, 4, StorageError::InvalidStoredTagData)?)?,
+    )
+    .map_err(|_| StorageError::InvalidStoredTagData)
+}
+
+fn todo_from_row(row: &Row<'_>) -> Result<Todo, StorageError> {
+    let lifecycle = parse_lifecycle(&required_text(row, 3, StorageError::InvalidStoredTodoData)?)
+        .ok_or(StorageError::InvalidStoredTodoData)?;
+    let project_id = column_text(row, 2)?
+        .map(|value| parse_id(&value).map(ProjectId::from_uuid))
+        .transpose()?;
+    Todo::new(
+        TodoId::from_uuid(parse_id(&required_text(
+            row,
+            0,
+            StorageError::InvalidStoredTodoData,
+        )?)?),
+        required_text(row, 1, StorageError::InvalidStoredTodoData)?,
+        project_id,
+        None,
+        vec![],
+        vec![],
+        lifecycle,
+        parse_version(row, 4, StorageError::InvalidStoredTodoData)?,
+        parse_timestamp(&required_text(row, 5, StorageError::InvalidStoredTodoData)?)?,
+        parse_timestamp(&required_text(row, 6, StorageError::InvalidStoredTodoData)?)?,
+        column_text(row, 7)?
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?,
+        column_text(row, 8)?
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?,
+        due_from_row(row)?,
+    )
+    .map_err(|_| StorageError::InvalidStoredTodoData)
+}
+
+fn column_text(row: &Row<'_>, index: usize) -> Result<Option<String>, StorageError> {
+    row.get::<_, Option<String>>(index)
+        .map_err(|_| StorageError::InvalidStoredData)
+}
+
+fn required_text(
+    row: &Row<'_>,
+    index: usize,
+    invalid: StorageError,
+) -> Result<String, StorageError> {
+    row.get::<_, String>(index).map_err(|_| invalid)
+}
+
+fn parse_version(
+    row: &Row<'_>,
+    index: usize,
+    invalid: StorageError,
+) -> Result<Version, StorageError> {
+    let raw = row.get::<_, i64>(index).map_err(|_| invalid.clone())?;
+    u64::try_from(raw)
+        .ok()
+        .and_then(|value| Version::try_from_value(value).ok())
+        .ok_or(invalid)
+}
+
+fn parse_lifecycle(value: &str) -> Option<Lifecycle> {
+    match value {
+        LIFECYCLE_OPEN => Some(Lifecycle::Open),
+        LIFECYCLE_COMPLETED => Some(Lifecycle::Completed),
+        LIFECYCLE_TRASHED => Some(Lifecycle::Trashed),
+        _ => None,
+    }
+}
+
+const fn lifecycle_text(lifecycle: Lifecycle) -> &'static str {
+    match lifecycle {
+        Lifecycle::Open => LIFECYCLE_OPEN,
+        Lifecycle::Completed => LIFECYCLE_COMPLETED,
+        Lifecycle::Trashed => LIFECYCLE_TRASHED,
+    }
+}
+
+const fn channel_text(channel: Channel) -> &'static str {
+    match channel {
+        Channel::Tui => CHANNEL_TUI,
+        Channel::Desktop => CHANNEL_DESKTOP,
+        Channel::Webhook => CHANNEL_WEBHOOK,
+    }
+}
+
+const fn reminder_lifecycle_text(lifecycle: ReminderLifecycle) -> &'static str {
+    match lifecycle {
+        ReminderLifecycle::Active => REMINDER_ACTIVE,
+        ReminderLifecycle::Paused => REMINDER_PAUSED,
+        ReminderLifecycle::Cancelled => REMINDER_CANCELLED,
+    }
+}
+
+const fn delivery_status_text(status: DeliveryStatus) -> &'static str {
+    match status {
+        DeliveryStatus::Pending => DELIVERY_PENDING,
+        DeliveryStatus::Sent => DELIVERY_SENT,
+        DeliveryStatus::Failed => DELIVERY_FAILED,
+    }
+}
+
+const fn frequency_text(frequency: Frequency) -> &'static str {
+    match frequency {
+        Frequency::Daily => FREQUENCY_DAILY,
+        Frequency::Weekly => FREQUENCY_WEEKLY,
+        Frequency::Monthly => FREQUENCY_MONTHLY,
+    }
+}
+
+// ── Stored shapes ──
+
+/// One identifier, written the one way the schema reads it.
+#[must_use]
+pub fn id_text(value: Uuid) -> String {
+    value.hyphenated().to_string()
+}
+
+fn parse_id(value: &str) -> Result<Uuid, StorageError> {
+    Uuid::parse_str(value).map_err(|_| StorageError::InvalidStoredData)
+}
+
+/// One instant, fixed width and always UTC, so text order is time order.
+#[must_use]
+pub fn timestamp_text(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(TIMESTAMP_PRECISION, true)
+}
+
+fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, StorageError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .map_err(|_| StorageError::InvalidStoredData)
+}
+
+/// One civil date, written the way a person writes one.
+#[must_use]
+pub fn date_text(value: NaiveDate) -> String {
+    value.format(DATE_FORMAT).to_string()
+}
+
+fn parse_date(value: &str) -> Result<NaiveDate, StorageError> {
+    NaiveDate::parse_from_str(value, DATE_FORMAT).map_err(|_| StorageError::InvalidStoredData)
+}
+
+// A stored instant is microseconds wide; anything finer would be silently truncated
+fn validate_timestamp_precision(
+    timestamp: DateTime<Utc>,
+    field: &'static str,
+) -> Result<(), StorageError> {
+    if timestamp.timestamp_subsec_nanos() % NANOS_PER_MICROSECOND == 0 {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidTimestampPrecision { field })
+    }
+}
+
+// ── Revalidation and version bounds ──
+
+fn revalidate(project: &Project) -> Result<(), StorageError> {
+    Project::new(
+        project.id(),
+        project.name().to_owned(),
+        project.lifecycle(),
+        project.version(),
+        project.created_at(),
+        project.updated_at(),
+    )?;
+    Ok(())
+}
+
+fn revalidate_tag(tag: &Tag) -> Result<(), StorageError> {
+    Tag::new(
+        tag.id(),
+        tag.name().to_owned(),
+        tag.version(),
+        tag.created_at(),
+        tag.updated_at(),
+    )?;
     Ok(())
 }
 
@@ -1815,477 +1811,33 @@ fn revalidate_todo(todo: &Todo) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn todo_creation_database_version(version: Version) -> Result<i64, StorageError> {
-    i64::try_from(version.value()).map_err(|_| StorageError::InvalidTodoCreation {
-        reason: "version exceeds PostgreSQL bigint range",
+fn database_version(version: Version) -> Result<i64, StorageError> {
+    i64::try_from(version.value()).map_err(|_| StorageError::InvalidReplacement {
+        reason: "version exceeds the stored integer range",
     })
-}
-
-fn todo_database_version(version: Version) -> Result<i64, StorageError> {
-    i64::try_from(version.value()).map_err(|_| StorageError::InvalidTodoReplacement {
-        reason: "version exceeds PostgreSQL bigint range",
-    })
-}
-
-fn todo_from_row(row: &Row) -> Result<Todo, StorageError> {
-    let lifecycle = match row.get::<_, &str>(3) {
-        "open" => Lifecycle::Open,
-        "completed" => Lifecycle::Completed,
-        "trashed" => Lifecycle::Trashed,
-        _ => return Err(StorageError::InvalidStoredTodoData),
-    };
-    let raw_version = row.get::<_, i64>(4);
-    let version = u64::try_from(raw_version)
-        .ok()
-        .and_then(|value| Version::try_from_value(value).ok())
-        .ok_or(StorageError::InvalidStoredTodoData)?;
-    Todo::new(
-        TodoId::from_uuid(row.get(0)),
-        row.get(1),
-        row.get::<_, Option<uuid::Uuid>>(2)
-            .map(ProjectId::from_uuid),
-        None,
-        vec![],
-        vec![],
-        lifecycle,
-        version,
-        row.get::<_, DateTime<Utc>>(5),
-        row.get::<_, DateTime<Utc>>(6),
-        row.get::<_, Option<DateTime<Utc>>>(7),
-        row.get::<_, Option<DateTime<Utc>>>(8),
-        due_from_row(row)?,
-    )
-    .map_err(|_| StorageError::InvalidStoredTodoData)
-}
-
-/// The three nullable columns one due value occupies.
-struct DueColumns {
-    date: Option<NaiveDate>,
-    at: Option<DateTime<Utc>>,
-    timezone: Option<String>,
-}
-
-impl From<Option<&TodoDue>> for DueColumns {
-    fn from(due: Option<&TodoDue>) -> Self {
-        match due {
-            None => Self {
-                date: None,
-                at: None,
-                timezone: None,
-            },
-            Some(TodoDue::Date { date, timezone }) => Self {
-                date: Some(*date),
-                at: None,
-                timezone: Some(timezone.clone()),
-            },
-            Some(TodoDue::Timed { at, timezone }) => Self {
-                date: None,
-                at: Some(at.with_timezone(&Utc)),
-                timezone: Some(timezone.clone()),
-            },
-        }
-    }
-}
-
-// The stored instant is reprojected into its own zone, so the exported offset is the zone's
-fn due_from_row(row: &Row) -> Result<Option<TodoDue>, StorageError> {
-    let date = row.get::<_, Option<NaiveDate>>(9);
-    let at = row.get::<_, Option<DateTime<Utc>>>(10);
-    let timezone = row.get::<_, Option<String>>(11);
-    match (date, at, timezone) {
-        (None, None, None) => Ok(None),
-        (Some(date), None, Some(timezone)) => TodoDue::date(date, timezone)
-            .map(Some)
-            .map_err(|_| StorageError::InvalidStoredTodoData),
-        (None, Some(at), Some(timezone)) => {
-            let zone = timezone
-                .parse::<Tz>()
-                .map_err(|_| StorageError::InvalidStoredTodoData)?;
-            let zoned = at.with_timezone(&zone);
-            TodoDue::timed(zoned.fixed_offset(), timezone)
-                .map(Some)
-                .map_err(|_| StorageError::InvalidStoredTodoData)
-        }
-        _ => Err(StorageError::InvalidStoredTodoData),
-    }
-}
-
-fn revalidate_tag(tag: &Tag) -> Result<(), StorageError> {
-    Tag::new(
-        tag.id(),
-        tag.name().to_owned(),
-        tag.version(),
-        tag.created_at(),
-        tag.updated_at(),
-    )?;
-    Ok(())
 }
 
 fn tag_creation_database_version(version: Version) -> Result<i64, StorageError> {
     i64::try_from(version.value()).map_err(|_| StorageError::InvalidTagCreation {
-        reason: "version exceeds PostgreSQL bigint range",
+        reason: "version exceeds the stored integer range",
     })
 }
 
 fn tag_database_version(version: Version) -> Result<i64, StorageError> {
     i64::try_from(version.value()).map_err(|_| StorageError::InvalidTagReplacement {
-        reason: "version exceeds PostgreSQL bigint range",
+        reason: "version exceeds the stored integer range",
     })
 }
 
-fn validate_timestamp_precision(
-    timestamp: DateTime<Utc>,
-    field: &'static str,
-) -> Result<(), StorageError> {
-    if timestamp.timestamp_subsec_nanos() % 1_000 == 0 {
-        Ok(())
-    } else {
-        Err(StorageError::InvalidTimestampPrecision { field })
-    }
-}
-
-fn tag_from_row(row: &Row) -> Result<Tag, StorageError> {
-    let raw_version = row.get::<_, i64>(2);
-    let version = u64::try_from(raw_version)
-        .ok()
-        .and_then(|value| Version::try_from_value(value).ok())
-        .ok_or(StorageError::InvalidStoredTagData)?;
-    Tag::new(
-        TagId::from_uuid(row.get(0)),
-        row.get(1),
-        version,
-        row.get::<_, DateTime<Utc>>(3),
-        row.get::<_, DateTime<Utc>>(4),
-    )
-    .map_err(|_| StorageError::InvalidStoredTagData)
-}
-
-fn revalidate(project: &Project) -> Result<(), StorageError> {
-    Project::new(
-        project.id(),
-        project.name().to_owned(),
-        project.lifecycle(),
-        project.version(),
-        project.created_at(),
-        project.updated_at(),
-    )?;
-    Ok(())
-}
-
-fn database_version(version: Version) -> Result<i64, StorageError> {
-    i64::try_from(version.value()).map_err(|_| StorageError::InvalidReplacement {
-        reason: "version exceeds PostgreSQL bigint range",
+fn todo_creation_database_version(version: Version) -> Result<i64, StorageError> {
+    i64::try_from(version.value()).map_err(|_| StorageError::InvalidTodoCreation {
+        reason: "version exceeds the stored integer range",
     })
 }
 
-const fn lifecycle_text(lifecycle: Lifecycle) -> &'static str {
-    match lifecycle {
-        Lifecycle::Open => "open",
-        Lifecycle::Completed => "completed",
-        Lifecycle::Trashed => "trashed",
-    }
-}
-
-fn project_from_row(row: &Row) -> Result<Project, StorageError> {
-    let lifecycle = match row.get::<_, &str>(2) {
-        "open" => Lifecycle::Open,
-        "completed" => Lifecycle::Completed,
-        "trashed" => Lifecycle::Trashed,
-        _ => return Err(StorageError::InvalidStoredData),
-    };
-    let raw_version = row.get::<_, i64>(3);
-    let version = u64::try_from(raw_version)
-        .ok()
-        .and_then(|value| Version::try_from_value(value).ok())
-        .ok_or(StorageError::InvalidStoredData)?;
-    Project::new(
-        ProjectId::from_uuid(row.get(0)),
-        row.get(1),
-        lifecycle,
-        version,
-        row.get::<_, DateTime<Utc>>(4),
-        row.get::<_, DateTime<Utc>>(5),
-    )
-    .map_err(|_| StorageError::InvalidStoredData)
-}
-
-/// Read the complete currently representable authority in one transaction.
-///
-/// Persist a validated reminder and verify the database returned its identity.
-pub async fn create_reminder(
-    database_url: &DatabaseUrl,
-    reminder: &Reminder,
-) -> Result<(), StorageError> {
-    reminder.validate()?;
-    validate_timestamp_precision(reminder.remind_at, "remind_at")?;
-    validate_timestamp_precision(reminder.created_at, "created_at")?;
-    validate_timestamp_precision(reminder.updated_at, "updated_at")?;
-    let (client, schema) = connect_authority(database_url, "reminder create").await?;
-    let table = schema.table("todo_reminders");
-    let channel = match reminder.channel {
-        Channel::Tui => "TUI",
-        Channel::Desktop => "DESKTOP",
-        Channel::Webhook => "WEBHOOK",
-    };
-    let lifecycle = match reminder.lifecycle {
-        crate::reminder::ReminderLifecycle::Active => "active",
-        crate::reminder::ReminderLifecycle::Paused => "paused",
-        crate::reminder::ReminderLifecycle::Cancelled => "cancelled",
-    };
-    let row = client
-        .query_one(
-            &format!(
-                "INSERT INTO {table} (id, todo_id, remind_at, channel, lifecycle, version, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id"
-            ),
-            &[
-                &reminder.id.as_uuid(),
-                &reminder.todo_id.as_uuid(),
-                &reminder.remind_at,
-                &channel,
-                &lifecycle,
-                &(reminder.version as i64),
-                &reminder.created_at,
-                &reminder.updated_at,
-            ],
-        )
-        .await
-        .map_err(|_| StorageError::Database { operation: "reminder create" })?;
-    if row.get::<_, uuid::Uuid>(0) != reminder.id.as_uuid() {
-        return Err(StorageError::Database {
-            operation: "reminder create",
-        });
-    }
-    Ok(())
-}
-
-/// Persist a pending, sent, or failed delivery record and verify its identity.
-pub async fn create_delivery_record(
-    database_url: &DatabaseUrl,
-    record: &DeliveryRecord,
-) -> Result<(), StorageError> {
-    record.validate()?;
-    validate_timestamp_precision(record.created_at, "created_at")?;
-    if let Some(attempted_at) = record.attempted_at {
-        validate_timestamp_precision(attempted_at, "attempted_at")?;
-    }
-    let (client, schema) = connect_authority(database_url, "delivery create").await?;
-    let table = schema.table("todo_reminder_deliveries");
-    let status = match record.status {
-        crate::reminder::DeliveryStatus::Pending => "pending",
-        crate::reminder::DeliveryStatus::Sent => "sent",
-        crate::reminder::DeliveryStatus::Failed => "failed",
-    };
-    let row = client
-        .query_one(
-            &format!(
-                "INSERT INTO {table} (id, reminder_id, idempotency_key, status, attempted_at, provider_reference, failure_code, created_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id"
-            ),
-            &[
-                &record.id.as_uuid(),
-                &record.reminder_id.as_uuid(),
-                &record.idempotency_key,
-                &status,
-                &record.attempted_at,
-                &record.provider_reference,
-                &record.failure_code,
-                &record.created_at,
-            ],
-        )
-        .await
-        .map_err(|_| StorageError::Database { operation: "delivery create" })?;
-    if row.get::<_, uuid::Uuid>(0) != record.id.as_uuid() {
-        return Err(StorageError::Database {
-            operation: "delivery create",
-        });
-    }
-    Ok(())
-}
-
-/// Replace the bounded recurrence rule for one authoritative todo atomically.
-pub async fn set_todo_recurrence(
-    database_url: &DatabaseUrl,
-    todo_id: TodoId,
-    start: NaiveDate,
-    rule: &Rule,
-) -> Result<(), StorageError> {
-    rule.validate(start)?;
-    let (mut client, schema) = connect_authority(database_url, "recurrence set").await?;
-    let transaction = client
-        .transaction()
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "recurrence set",
-        })?;
-    let todos = schema.table("todos");
-    let exists = transaction
-        .query_opt(
-            &format!("SELECT 1 FROM {todos} WHERE id = $1"),
-            &[&todo_id.as_uuid()],
-        )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "recurrence set",
-        })?
-        .is_some();
-    if !exists {
-        return Err(StorageError::InvalidStoredTodoData);
-    }
-    let recurrence = schema.table("todo_recurrence");
-    let frequency = match rule.frequency {
-        Frequency::Daily => "DAILY",
-        Frequency::Weekly => "WEEKLY",
-        Frequency::Monthly => "MONTHLY",
-    };
-    transaction
-        .execute(
-            &format!(
-                "INSERT INTO {recurrence} (todo_id, start_date, frequency, interval, occurrence_count, until_date) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
-                 ON CONFLICT (todo_id) DO UPDATE SET start_date = EXCLUDED.start_date, frequency = EXCLUDED.frequency, \
-                 interval = EXCLUDED.interval, occurrence_count = EXCLUDED.occurrence_count, until_date = EXCLUDED.until_date"
-            ),
-            &[&todo_id.as_uuid(), &start, &frequency, &i64::from(rule.interval), &rule.count.map(i64::from), &rule.until],
-        )
-        .await
-        .map_err(|_| StorageError::Database { operation: "recurrence set" })?;
-    transaction
-        .commit()
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "recurrence set",
-        })?;
-    Ok(())
-}
-
-/// Read the authoritative recurrence rule for one todo.
-pub async fn find_todo_recurrence(
-    database_url: &DatabaseUrl,
-    todo_id: TodoId,
-) -> Result<Option<(NaiveDate, Rule)>, StorageError> {
-    let (client, schema) = connect_authority(database_url, "recurrence find").await?;
-    let recurrence = schema.table("todo_recurrence");
-    let row = client
-        .query_opt(
-            &format!("SELECT start_date, frequency, interval, occurrence_count, until_date FROM {recurrence} WHERE todo_id = $1"),
-            &[&todo_id.as_uuid()],
-        )
-        .await
-        .map_err(|_| StorageError::Database { operation: "recurrence find" })?;
-    let Some(row) = row else { return Ok(None) };
-    let start: NaiveDate = row
-        .try_get(0)
-        .map_err(|_| StorageError::InvalidStoredTodoData)?;
-    let frequency = match row
-        .try_get::<_, String>(1)
-        .map_err(|_| StorageError::InvalidStoredTodoData)?
-        .as_str()
-    {
-        "DAILY" => Frequency::Daily,
-        "WEEKLY" => Frequency::Weekly,
-        "MONTHLY" => Frequency::Monthly,
-        _ => return Err(StorageError::InvalidStoredTodoData),
-    };
-    let interval = u32::try_from(
-        row.try_get::<_, i64>(2)
-            .map_err(|_| StorageError::InvalidStoredTodoData)?,
-    )
-    .map_err(|_| StorageError::InvalidStoredTodoData)?;
-    let count = row
-        .try_get::<_, Option<i64>>(3)
-        .map_err(|_| StorageError::InvalidStoredTodoData)?
-        .map(u32::try_from)
-        .transpose()
-        .map_err(|_| StorageError::InvalidStoredTodoData)?;
-    let until = row
-        .try_get(4)
-        .map_err(|_| StorageError::InvalidStoredTodoData)?;
-    let rule = Rule::new(frequency, interval, count, until, start)?;
-    Ok(Some((start, rule)))
-}
-
-/// Relationship, recurrence, and reminder rows are not fabricated here; each
-/// must be added to the export contract with its own migration and tests.
-pub async fn export_authority(database_url: &DatabaseUrl) -> Result<AuthorityExport, StorageError> {
-    let (mut client, schema) = connect_authority(database_url, "interop export").await?;
-    let transaction = client
-        .transaction()
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "interop export",
-        })?;
-    let projects_table = schema.table("projects");
-    let tags_table = schema.table("tags");
-    let todos_table = schema.table("todos");
-    let project_rows = transaction
-        .query(
-            &format!("SELECT id, name, lifecycle, version, created_at, updated_at FROM {projects_table} ORDER BY id"),
-            &[],
-        )
-        .await
-        .map_err(|_| StorageError::Database { operation: "interop export" })?;
-    let tag_rows = transaction
-        .query(
-            &format!(
-                "SELECT id, name, version, created_at, updated_at FROM {tags_table} ORDER BY id"
-            ),
-            &[],
-        )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "interop export",
-        })?;
-    let todo_rows = transaction
-        .query(
-            &format!(
-                "SELECT id, title, project_id, lifecycle, version, created_at, updated_at, \
-                 completed_at, trashed_at, due_date, due_at, due_timezone \
-                 FROM {todos_table} ORDER BY id"
-            ),
-            &[],
-        )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "interop export",
-        })?;
-    let state_table = schema.table("mg_remindr_authority_state");
-    let revision = transaction
-        .query_opt(
-            &format!("SELECT revision FROM {state_table} WHERE singleton = true"),
-            &[],
-        )
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "interop export",
-        })?
-        .and_then(|row| u64::try_from(row.get::<_, i64>(0)).ok())
-        .ok_or(StorageError::Database {
-            operation: "interop export",
-        })?;
-    let projects = project_rows
-        .iter()
-        .map(project_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    let tags = tag_rows
-        .iter()
-        .map(tag_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut todos = Vec::with_capacity(todo_rows.len());
-    for row in &todo_rows {
-        todos.push(load_todo_relationships(&transaction, &schema, todo_from_row(row)?).await?);
-    }
-    transaction
-        .commit()
-        .await
-        .map_err(|_| StorageError::Database {
-            operation: "interop export",
-        })?;
-    Ok(AuthorityExport {
-        projects,
-        tags,
-        todos,
-        revision,
+fn todo_database_version(version: Version) -> Result<i64, StorageError> {
+    i64::try_from(version.value()).map_err(|_| StorageError::InvalidTodoReplacement {
+        reason: "version exceeds the stored integer range",
     })
 }
 
@@ -2293,22 +1845,224 @@ pub async fn export_authority(database_url: &DatabaseUrl) -> Result<AuthorityExp
 mod tests {
     use super::*;
     use chrono::{TimeZone, Timelike};
+    use tempfile::TempDir;
+
+    // A store of its own, in a directory that goes away with the test
+    fn scratch() -> (TempDir, Store) {
+        let directory = tempfile::tempdir().expect("create a scratch directory");
+        let store = Store::open(directory.path().join("remindr.sqlite")).expect("open the store");
+        (directory, store)
+    }
+
+    fn project(lifecycle: Lifecycle, version: u64) -> Project {
+        let created_at = Utc.with_ymd_and_hms(2026, 9, 19, 12, 0, 0).unwrap();
+        Project::new(
+            ProjectId::from_uuid(Uuid::from_u128(0x1234)),
+            "Authority".to_owned(),
+            lifecycle,
+            Version::try_from_value(version).unwrap(),
+            created_at,
+            created_at + chrono::Duration::seconds(i64::try_from(version).unwrap()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_empty_file_becomes_a_migrated_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested/remindr.sqlite");
+        assert!(
+            migration_status(&path)
+                .unwrap()
+                .iter()
+                .all(|state| !state.applied)
+        );
+        assert!(migrate(&path).unwrap().iter().all(|state| state.applied));
+        // Reapplying is idempotent
+        assert!(migrate(&path).unwrap().iter().all(|state| state.applied));
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn the_journal_is_wal_and_foreign_keys_are_enforced() {
+        let (_directory, store) = scratch();
+        let connection = store.conn().unwrap();
+        let mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert!(mode.eq_ignore_ascii_case(JOURNAL_MODE_WAL));
+        let enforced: i64 = connection
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(enforced, 1);
+    }
+
+    #[test]
+    fn a_ledger_naming_an_unknown_migration_is_refused() {
+        let (_directory, store) = scratch();
+        store
+            .conn()
+            .unwrap()
+            .execute(
+                &format!(
+                    "INSERT INTO {LEDGER} (version, name, checksum, applied_at) \
+                     VALUES (99, 'future_schema', 'unknown', '1970-01-01T00:00:00.000000Z')"
+                ),
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            migration_status(store.path()),
+            Err(StorageError::UnknownMigration { version: 99, .. })
+        ));
+        assert!(matches!(
+            migrate(store.path()),
+            Err(StorageError::UnknownMigration { version: 99, .. })
+        ));
+    }
+
+    #[test]
+    fn a_rewritten_migration_is_refused_rather_than_skipped() {
+        let (_directory, store) = scratch();
+        store
+            .conn()
+            .unwrap()
+            .execute(
+                &format!("UPDATE {LEDGER} SET checksum = 'rewritten' WHERE version = 1"),
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            migration_status(store.path()),
+            Err(StorageError::MigrationChecksumDrift { version: 1 })
+        );
+    }
+
+    #[test]
+    fn a_recorded_migration_whose_table_vanished_is_drift() {
+        let (_directory, store) = scratch();
+        store
+            .conn()
+            .unwrap()
+            .execute_batch("DROP TABLE todo_reminder_deliveries;")
+            .unwrap();
+        assert_eq!(
+            migration_status(store.path()),
+            Err(StorageError::MigrationSchemaDrift {
+                version: 1,
+                table: "todo_reminder_deliveries"
+            })
+        );
+    }
+
+    #[test]
+    fn a_table_no_ledger_row_explains_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("remindr.sqlite");
+        let store = Store::attach(&path).unwrap();
+        store
+            .conn()
+            .unwrap()
+            .execute_batch("CREATE TABLE projects (id TEXT PRIMARY KEY);")
+            .unwrap();
+        assert_eq!(
+            migration_status(&path),
+            Err(StorageError::UnledgeredMigrationTable { table: "projects" })
+        );
+        assert_eq!(
+            migrate(&path),
+            Err(StorageError::UnledgeredMigrationTable { table: "projects" })
+        );
+    }
+
+    #[test]
+    fn optimistic_project_writes_keep_one_history() {
+        let (_directory, store) = scratch();
+        let repository = ProjectRepository::new(store);
+        let original = project(Lifecycle::Open, 1);
+        repository.create(&original).unwrap();
+        assert!(matches!(
+            repository.create(&original),
+            Err(StorageError::ProjectAlreadyExists { .. })
+        ));
+        assert_eq!(
+            repository.find(original.id()).unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(repository.list().unwrap(), vec![original.clone()]);
+
+        let completed = project(Lifecycle::Completed, 2);
+        repository.replace(Version::new(), &completed).unwrap();
+        assert_eq!(
+            repository.find(completed.id()).unwrap(),
+            Some(completed.clone())
+        );
+        // The version that was already consumed cannot be replayed
+        assert_eq!(
+            repository.replace(Version::new(), &completed),
+            Err(StorageError::VersionConflict {
+                project_id: completed.id(),
+                expected: 1,
+                actual: 2
+            })
+        );
+    }
+
+    #[test]
+    fn a_replacement_may_not_rewrite_history() {
+        let (_directory, store) = scratch();
+        let repository = ProjectRepository::new(store);
+        let original = project(Lifecycle::Open, 1);
+        repository.create(&original).unwrap();
+        let backward = Project::new(
+            original.id(),
+            "Backward timestamp".to_owned(),
+            Lifecycle::Open,
+            original.version().next().unwrap(),
+            original.created_at(),
+            original.updated_at() - chrono::Duration::seconds(1),
+        )
+        .unwrap();
+        assert_eq!(
+            repository.replace(original.version(), &backward),
+            Err(StorageError::InvalidReplacement {
+                reason: "updated_at must not move backward"
+            })
+        );
+        assert_eq!(repository.find(original.id()).unwrap(), Some(original));
+    }
+
+    #[test]
+    fn replacing_an_absent_project_says_so() {
+        let (_directory, store) = scratch();
+        let repository = ProjectRepository::new(store);
+        let absent = project(Lifecycle::Open, 2);
+        assert_eq!(
+            repository.replace(Version::new(), &absent),
+            Err(StorageError::ProjectNotFound {
+                project_id: absent.id()
+            })
+        );
+        assert_eq!(repository.find(absent.id()).unwrap(), None);
+    }
 
     #[test]
     fn storage_errors_do_not_echo_driver_or_connection_material() {
         let error = StorageError::Connect;
         assert_eq!(error.to_string(), "mg-remindr database connection failed");
-        assert!(!format!("{error:?}").contains("postgres://"));
+        assert!(!format!("{error:?}").contains("sqlite"));
     }
 
     #[test]
-    fn postgres_timestamp_precision_contract_rejects_sub_microseconds() {
+    fn the_stored_timestamp_contract_rejects_sub_microseconds() {
         let exact = Utc
             .with_ymd_and_hms(2026, 8, 28, 12, 0, 0)
             .unwrap()
             .with_nanosecond(123_456_000)
             .unwrap();
         assert_eq!(validate_timestamp_precision(exact, "created_at"), Ok(()));
+        assert_eq!(timestamp_text(exact), "2026-08-28T12:00:00.123456Z");
+        assert_eq!(parse_timestamp(&timestamp_text(exact)).unwrap(), exact);
 
         let inexact = exact + chrono::Duration::nanoseconds(1);
         assert_eq!(
@@ -2320,18 +2074,30 @@ mod tests {
     }
 
     #[test]
+    fn stored_instants_sort_as_text_the_way_they_sort_as_time() {
+        let earlier = Utc.with_ymd_and_hms(2026, 8, 28, 12, 0, 0).unwrap();
+        let later = earlier + chrono::Duration::microseconds(1);
+        assert!(timestamp_text(earlier) < timestamp_text(later));
+    }
+
+    #[test]
     fn tag_creation_version_overflow_has_creation_error_contract() {
         let version = Version::try_from_value(u64::MAX).unwrap();
         let error = tag_creation_database_version(version).unwrap_err();
         assert_eq!(
             error,
             StorageError::InvalidTagCreation {
-                reason: "version exceeds PostgreSQL bigint range"
+                reason: "version exceeds the stored integer range"
             }
         );
         assert_eq!(
             error.to_string(),
-            "invalid tag creation: version exceeds PostgreSQL bigint range"
+            "invalid tag creation: version exceeds the stored integer range"
         );
+    }
+
+    #[test]
+    fn the_embedded_migration_matches_its_recorded_checksum() {
+        assert_eq!(validate_migration_sources(), Ok(()));
     }
 }

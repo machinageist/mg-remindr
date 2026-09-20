@@ -1,5 +1,4 @@
-use crate::config::DatabaseUrl;
-use crate::storage::{AuthorityExport, StorageError, export_authority};
+use crate::storage::{AuthorityExport, StorageError, Store, export_authority};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -81,13 +80,13 @@ pub struct Diagnostic {
     pub message: String,
 }
 
-pub async fn export(database_url: &DatabaseUrl) -> Result<Snapshot, StorageError> {
+pub fn export(store: &Store) -> Result<Snapshot, StorageError> {
     let AuthorityExport {
         projects,
         tags,
         todos,
         revision,
-    } = export_authority(database_url).await?;
+    } = export_authority(store)?;
     let mut records = Vec::with_capacity(projects.len() + tags.len() + todos.len());
     let mut links = Vec::new();
     for project in projects {

@@ -1,14 +1,14 @@
-use mg_remindr::storage::{
-    AUTHORITY_REVISION_MIGRATION, FOUNDATION_MIGRATION, MIGRATIONS,
-    REMINDR_AUTHORITY_RENAME_MIGRATION, TAG_MIGRATION, TODO_DUE_MIGRATION,
-    TODO_LIFECYCLE_TIMES_MIGRATION, TODO_MIGRATION, TODO_RECURRENCE_MIGRATION,
-    TODO_RELATIONSHIP_MIGRATION, TODO_REMINDER_DELIVERY_MIGRATION, TODO_REMINDER_MIGRATION,
-    TODO_TAG_MIGRATION,
-};
+// Author: Jeff
+// Date: 2026-09-20
+// Description: What the embedded schema is allowed to be — one migration, append-only, and
+//              exactly the tables it claims
+// Notes: The PostgreSQL store grew twelve migrations because each shipped separately. The
+//        SQLite store starts from one, and the rules that kept those twelve honest are the
+//        rules this one is held to: pinned by checksum, never rewritten, never destructive
+
+use mg_remindr::storage::{AUTHORITY_MIGRATION, MIGRATIONS};
 use sha2::{Digest, Sha256};
 
-const IMMUTABLE_V1_SHA256: &str =
-    "0c821017adbb6c219ad371a7729b7d898a178bd9102279d71524504710ed78c0";
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 fn sha256_hex(sql: &str) -> String {
@@ -24,169 +24,64 @@ fn sha256_hex(sql: &str) -> String {
 }
 
 #[test]
-fn foundation_migrations_are_embedded_and_append_only() {
-    assert_eq!(MIGRATIONS.len(), 12);
+fn the_authority_migration_is_embedded_and_pinned_by_its_checksum() {
+    assert_eq!(MIGRATIONS.len(), 1);
     assert_eq!(MIGRATIONS[0].version, 1);
-    assert_eq!(MIGRATIONS[0].name, "project_authority");
-    assert_eq!(MIGRATIONS[0].sql, FOUNDATION_MIGRATION);
-    assert!(FOUNDATION_MIGRATION.contains("CREATE TABLE projects"));
-    assert!(!FOUNDATION_MIGRATION.contains("IF NOT EXISTS"));
-    let digest = Sha256::digest(FOUNDATION_MIGRATION.as_bytes());
-    let digest = digest
-        .iter()
-        .flat_map(|byte| {
-            [
-                char::from(HEX[usize::from(byte >> 4)]),
-                char::from(HEX[usize::from(byte & 0x0f)]),
-            ]
-        })
-        .collect::<String>();
-    assert_eq!(digest, IMMUTABLE_V1_SHA256);
-    assert!(FOUNDATION_MIGRATION.contains("version bigint NOT NULL"));
-    assert!(FOUNDATION_MIGRATION.contains("CHECK (version >= 1)"));
-    assert!(FOUNDATION_MIGRATION.contains("CHECK (lifecycle IN ('open', 'completed', 'trashed'))"));
-    assert!(!FOUNDATION_MIGRATION.contains("DROP TABLE"));
-    assert!(!FOUNDATION_MIGRATION.contains("CREATE EXTENSION"));
-
-    assert_eq!(MIGRATIONS[1].version, 2);
-    assert_eq!(MIGRATIONS[1].name, "tag_authority");
-    assert_eq!(MIGRATIONS[1].sql, TAG_MIGRATION);
-    assert!(TAG_MIGRATION.contains("CREATE TABLE tags"));
-    assert!(!TAG_MIGRATION.contains("IF NOT EXISTS"));
-    assert!(TAG_MIGRATION.contains("version bigint NOT NULL"));
-    assert!(TAG_MIGRATION.contains("CHECK (version >= 1)"));
-    assert!(TAG_MIGRATION.contains("CHECK (updated_at >= created_at)"));
-    assert!(!TAG_MIGRATION.contains("DROP "));
-    assert!(!TAG_MIGRATION.contains("ALTER TABLE projects"));
-    assert!(!TAG_MIGRATION.contains("CREATE EXTENSION"));
-
-    assert_eq!(MIGRATIONS[2].version, 3);
-    assert_eq!(MIGRATIONS[2].name, "todo_authority");
-    assert_eq!(MIGRATIONS[2].sql, TODO_MIGRATION);
-    assert!(TODO_MIGRATION.contains("CREATE TABLE todos"));
-    assert!(TODO_MIGRATION.contains("project_id uuid REFERENCES projects(id)"));
-    assert!(TODO_MIGRATION.contains("CHECK (updated_at >= created_at)"));
-    assert!(!TODO_MIGRATION.contains("parent_id"));
-    assert!(!TODO_MIGRATION.contains("reminder_id"));
-    assert!(!TODO_MIGRATION.contains("recurrence_rule"));
-    assert!(!TODO_MIGRATION.contains("IF NOT EXISTS"));
-    assert!(!TODO_MIGRATION.contains("DROP "));
-
-    assert_eq!(MIGRATIONS[3].version, 4);
-    assert_eq!(MIGRATIONS[3].name, "todo_tag_authority");
-    assert_eq!(MIGRATIONS[3].sql, TODO_TAG_MIGRATION);
-    assert!(TODO_TAG_MIGRATION.contains("CREATE TABLE todo_tags"));
-    assert!(TODO_TAG_MIGRATION.contains("PRIMARY KEY (todo_id, tag_id)"));
-    assert!(TODO_TAG_MIGRATION.contains("ON DELETE CASCADE"));
-    assert!(TODO_TAG_MIGRATION.contains("ON DELETE RESTRICT"));
-    assert!(!TODO_TAG_MIGRATION.contains("DROP "));
-
-    assert_eq!(MIGRATIONS[4].version, 5);
-    assert_eq!(MIGRATIONS[4].name, "authority_revision");
-    assert_eq!(MIGRATIONS[4].sql, AUTHORITY_REVISION_MIGRATION);
-    assert!(AUTHORITY_REVISION_MIGRATION.contains("CREATE TABLE mg_todo_authority_state"));
-    assert!(
-        AUTHORITY_REVISION_MIGRATION.contains("CREATE FUNCTION mg_todo_bump_authority_revision")
-    );
-    assert!(AUTHORITY_REVISION_MIGRATION.contains("CREATE TRIGGER mg_todo_projects_revision"));
-    assert!(AUTHORITY_REVISION_MIGRATION.contains("CREATE TRIGGER mg_todo_tags_revision"));
-    assert!(AUTHORITY_REVISION_MIGRATION.contains("CREATE TRIGGER mg_todo_todos_revision"));
-    assert!(!AUTHORITY_REVISION_MIGRATION.contains("DROP "));
-
-    assert_eq!(MIGRATIONS[5].version, 6);
-    assert_eq!(MIGRATIONS[5].name, "todo_relationship_authority");
-    assert_eq!(MIGRATIONS[5].sql, TODO_RELATIONSHIP_MIGRATION);
-    assert!(TODO_RELATIONSHIP_MIGRATION.contains("CREATE TABLE todo_parents"));
-    assert!(TODO_RELATIONSHIP_MIGRATION.contains("CREATE TABLE todo_dependencies"));
-    assert!(TODO_RELATIONSHIP_MIGRATION.contains("CHECK (child_id <> parent_id)"));
-    assert!(!TODO_RELATIONSHIP_MIGRATION.contains("DROP "));
-
-    assert_eq!(MIGRATIONS[6].version, 7);
-    assert_eq!(MIGRATIONS[6].name, "todo_recurrence_authority");
-    assert_eq!(MIGRATIONS[6].sql, TODO_RECURRENCE_MIGRATION);
-    assert!(TODO_RECURRENCE_MIGRATION.contains("CREATE TABLE todo_recurrence"));
-    assert!(TODO_RECURRENCE_MIGRATION.contains("occurrence_count"));
-    assert!(TODO_RECURRENCE_MIGRATION.contains("until_date"));
-    assert!(!TODO_RECURRENCE_MIGRATION.contains("DROP "));
-
-    assert_eq!(MIGRATIONS[7].version, 8);
-    assert_eq!(MIGRATIONS[7].name, "todo_reminder_authority");
-    assert_eq!(MIGRATIONS[7].sql, TODO_REMINDER_MIGRATION);
-    assert!(TODO_REMINDER_MIGRATION.contains("CREATE TABLE todo_reminders"));
-    assert_eq!(sha256_hex(TODO_REMINDER_MIGRATION), MIGRATIONS[7].checksum);
-    assert!(!TODO_REMINDER_MIGRATION.contains("DROP "));
-    assert_eq!(MIGRATIONS[8].version, 9);
-    assert_eq!(MIGRATIONS[8].name, "todo_reminder_delivery_authority");
-    assert_eq!(MIGRATIONS[8].sql, TODO_REMINDER_DELIVERY_MIGRATION);
-    assert!(TODO_REMINDER_DELIVERY_MIGRATION.contains("CREATE TABLE todo_reminder_deliveries"));
-    assert!(TODO_REMINDER_DELIVERY_MIGRATION.contains("idempotency_key text NOT NULL UNIQUE"));
-    assert_eq!(
-        sha256_hex(TODO_REMINDER_DELIVERY_MIGRATION),
-        MIGRATIONS[8].checksum
-    );
-    assert!(!TODO_REMINDER_DELIVERY_MIGRATION.contains("DROP "));
+    assert_eq!(MIGRATIONS[0].name, "remindr_authority");
+    assert_eq!(MIGRATIONS[0].sql, AUTHORITY_MIGRATION);
+    assert_eq!(sha256_hex(AUTHORITY_MIGRATION), MIGRATIONS[0].checksum);
 }
 
 #[test]
-fn lifecycle_times_migration_extends_todos_without_inventing_history() {
-    assert_eq!(MIGRATIONS[9].version, 10);
-    assert_eq!(MIGRATIONS[9].name, "todo_lifecycle_times");
-    assert_eq!(MIGRATIONS[9].sql, TODO_LIFECYCLE_TIMES_MIGRATION);
-    assert!(TODO_LIFECYCLE_TIMES_MIGRATION.contains("ALTER TABLE todos"));
-    assert!(TODO_LIFECYCLE_TIMES_MIGRATION.contains("ADD COLUMN completed_at timestamptz"));
-    assert!(TODO_LIFECYCLE_TIMES_MIGRATION.contains("ADD COLUMN trashed_at timestamptz"));
-    assert_eq!(
-        sha256_hex(TODO_LIFECYCLE_TIMES_MIGRATION),
-        MIGRATIONS[9].checksum
-    );
-    assert!(!TODO_LIFECYCLE_TIMES_MIGRATION.contains("DROP "));
-    assert!(!TODO_LIFECYCLE_TIMES_MIGRATION.contains("UPDATE "));
-}
-
-#[test]
-fn due_migration_extends_todos_with_one_consistent_form() {
-    assert_eq!(MIGRATIONS[10].version, 11);
-    assert_eq!(MIGRATIONS[10].name, "todo_due");
-    assert_eq!(MIGRATIONS[10].sql, TODO_DUE_MIGRATION);
-    assert!(TODO_DUE_MIGRATION.contains("ALTER TABLE todos"));
-    assert!(TODO_DUE_MIGRATION.contains("ADD COLUMN due_date date"));
-    assert!(TODO_DUE_MIGRATION.contains("ADD COLUMN due_at timestamptz"));
-    assert!(TODO_DUE_MIGRATION.contains("ADD COLUMN due_timezone text"));
-    assert_eq!(sha256_hex(TODO_DUE_MIGRATION), MIGRATIONS[10].checksum);
-    assert!(!TODO_DUE_MIGRATION.contains("DROP "));
-    assert!(!TODO_DUE_MIGRATION.contains("UPDATE "));
-
-    assert_eq!(MIGRATIONS[11].version, 12);
-    assert_eq!(MIGRATIONS[11].name, "remindr_authority_rename");
-    assert_eq!(MIGRATIONS[11].sql, REMINDR_AUTHORITY_RENAME_MIGRATION);
-    assert_eq!(
-        sha256_hex(REMINDR_AUTHORITY_RENAME_MIGRATION),
-        MIGRATIONS[11].checksum
-    );
-    // A pure rename: it must not create, drop, or rewrite any row
-    assert!(
-        REMINDR_AUTHORITY_RENAME_MIGRATION
-            .contains("ALTER TABLE mg_todo_authority_state RENAME TO mg_remindr_authority_state")
-    );
-    assert!(!REMINDR_AUTHORITY_RENAME_MIGRATION.contains("CREATE TABLE"));
-    assert!(!REMINDR_AUTHORITY_RENAME_MIGRATION.contains("DROP "));
-    assert!(!REMINDR_AUTHORITY_RENAME_MIGRATION.contains("DELETE "));
-    // The trigger body must follow the table to its new name
-    assert!(REMINDR_AUTHORITY_RENAME_MIGRATION.contains("UPDATE mg_remindr_authority_state"));
-}
-
-#[test]
-fn only_the_lifecycle_times_migration_extends_a_table_created_earlier() {
+fn the_migration_creates_every_table_it_claims_and_claims_every_table_it_creates() {
     for migration in MIGRATIONS {
-        let creates = migration
-            .sql
-            .contains(&format!("CREATE TABLE {}", migration.table));
+        for table in migration.tables {
+            assert!(
+                migration.sql.contains(&format!("CREATE TABLE {table}")),
+                "migration {} claims {table} without creating it",
+                migration.version
+            );
+        }
+        let created = migration.sql.matches("CREATE TABLE ").count();
         assert_eq!(
-            creates, migration.creates_table,
-            "migration {} disagrees about owning {}",
-            migration.version, migration.table
+            created,
+            migration.tables.len(),
+            "migration {} creates a table its ledger entry does not name",
+            migration.version
         );
     }
+}
+
+#[test]
+fn the_migration_is_append_only_and_never_destructive() {
+    // IF NOT EXISTS would let a rewritten migration pass over a store it does not match
+    assert!(!AUTHORITY_MIGRATION.contains("IF NOT EXISTS"));
+    assert!(!AUTHORITY_MIGRATION.contains("DROP "));
+    // `ON DELETE` is part of a reference, so only a statement counts as destructive
+    assert!(!AUTHORITY_MIGRATION.contains("DELETE FROM"));
+    assert!(!AUTHORITY_MIGRATION.contains("ALTER TABLE"));
+    // the only writes are the triggers that bump the authority revision, and they
+    // touch nothing but the one row that counts revisions
+    for line in AUTHORITY_MIGRATION.lines().map(str::trim_start) {
+        if line.starts_with("UPDATE ") {
+            assert!(
+                line.starts_with("UPDATE mg_remindr_authority_state"),
+                "the schema writes to something other than the revision counter: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_authority_keeps_the_invariants_the_domain_relies_on() {
+    assert!(AUTHORITY_MIGRATION.contains("CHECK (version >= 1)"));
+    assert!(AUTHORITY_MIGRATION.contains("CHECK (lifecycle IN ('open', 'completed', 'trashed'))"));
+    assert!(AUTHORITY_MIGRATION.contains("CHECK (updated_at >= created_at)"));
+    assert!(AUTHORITY_MIGRATION.contains("PRIMARY KEY (todo_id, tag_id)"));
+    assert!(AUTHORITY_MIGRATION.contains("ON DELETE CASCADE"));
+    assert!(AUTHORITY_MIGRATION.contains("ON DELETE RESTRICT"));
+    assert!(AUTHORITY_MIGRATION.contains("CHECK (child_id <> parent_id)"));
+    assert!(AUTHORITY_MIGRATION.contains("idempotency_key TEXT NOT NULL UNIQUE"));
 }
 
 #[test]

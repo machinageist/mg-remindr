@@ -1,28 +1,24 @@
 use clap::{Args, Parser, Subcommand};
 use mg_remindr::{
-    config::{Config, DatabaseUrl},
+    config::Config,
     domain::{Lifecycle, Project, ProjectId, Tag, TagId, Todo, TodoId, Version},
     human,
-    storage::{
-        PostgresProjectRepository, PostgresTagRepository, PostgresTodoRepository, migrate,
-        migration_status,
-    },
+    storage::{ProjectRepository, Store, TagRepository, TodoRepository, migrate, migration_status},
 };
 use serde::Serialize;
-use std::{process::ExitCode, str::FromStr};
+use std::{
+    path::{Path, PathBuf},
+    process::ExitCode,
+    str::FromStr,
+};
 use thiserror::Error;
 
 #[derive(Debug, Parser)]
-#[command(name = "mg-remindr", about = "Local PostgreSQL todo authority")]
+#[command(name = "mg-remindr", about = "Local SQLite todo authority")]
 struct Cli {
-    /// Local PostgreSQL URL; defaults to `MG_REMINDR_DATABASE_URL` or config.toml
-    #[arg(
-        long,
-        global = true,
-        env = "MG_REMINDR_DATABASE_URL",
-        hide_env_values = true
-    )]
-    database_url: Option<String>,
+    /// The store file; defaults to `MG_REMINDR_DB` or config.toml
+    #[arg(long, global = true, env = "MG_REMINDR_DB", hide_env_values = true)]
+    db: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -206,22 +202,13 @@ enum CliError {
     Storage(#[from] mg_remindr::storage::StorageError),
     #[error("output serialization failed")]
     Output,
-    #[error("runtime initialization failed")]
-    Runtime,
     #[error(transparent)]
     Human(#[from] human::HumanError),
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        eprintln!("mg-remindr: {}", CliError::Runtime);
-        return ExitCode::FAILURE;
-    };
-    match runtime.block_on(run(cli)) {
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("mg-remindr: {error}");
@@ -230,48 +217,47 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<(), CliError> {
-    let database_url = database_url(cli.database_url)?;
+fn run(cli: Cli) -> Result<(), CliError> {
+    let path = database_path(cli.db)?;
+    // migration commands take the path itself: they report on a store they must not create
     match cli.command {
         Command::Migration { command } => match command {
-            MigrationCommand::Status => print_json(&migration_status(&database_url).await?),
-            MigrationCommand::Apply => print_json(&migrate(&database_url).await?),
+            MigrationCommand::Status => print_json(&migration_status(&path)?),
+            MigrationCommand::Apply => print_json(&migrate(&path)?),
         },
-        Command::Project { command } => {
-            run_project(PostgresProjectRepository::new(database_url), command).await
-        }
-        Command::Tag { command } => {
-            run_tag(PostgresTagRepository::new(database_url), command).await
-        }
-        Command::Todo { command } => {
-            run_todo(PostgresTodoRepository::new(database_url), command).await
-        }
+        Command::Project { command } => run_project(&path, command),
+        Command::Tag { command } => run_tag(&path, command),
+        Command::Todo { command } => run_todo(&path, command),
         Command::Interop { command } => match command {
-            InteropCommand::Export => {
-                print_json(&mg_remindr::interop::export(&database_url).await?)
-            }
+            InteropCommand::Export => print_json(&mg_remindr::interop::export(&store(&path)?)?),
         },
-        Command::Add(input) => add(PostgresTodoRepository::new(database_url), input).await,
-        Command::Ls(input) => list(PostgresTodoRepository::new(database_url), input).await,
-        Command::Edit(input) => edit(PostgresTodoRepository::new(database_url), input).await,
-        Command::Done(input) => {
-            close(
-                PostgresTodoRepository::new(database_url),
-                Lifecycle::Completed,
-                input,
-            )
-            .await
-        }
-        Command::Rm(input) => {
-            close(
-                PostgresTodoRepository::new(database_url),
-                Lifecycle::Trashed,
-                input,
-            )
-            .await
-        }
-        Command::Restore(input) => reopen(PostgresTodoRepository::new(database_url), input).await,
+        Command::Add(input) => add(&path, input),
+        Command::Ls(input) => list(&path, &input),
+        Command::Edit(input) => edit(&path, input),
+        Command::Done(input) => close(&path, Lifecycle::Completed, &input),
+        Command::Rm(input) => close(&path, Lifecycle::Trashed, &input),
+        Command::Restore(input) => reopen(&path, &input),
     }
+}
+
+// Open the store, applying any migration it has not recorded
+// Every command parses its input first and opens the store here, so unreadable input
+// is reported without creating a store or touching an existing one
+fn store(path: &Path) -> Result<Store, CliError> {
+    Ok(Store::open(path)?)
+}
+
+// One repository each, over a store opened at the moment it is needed
+fn projects(path: &Path) -> Result<ProjectRepository, CliError> {
+    Ok(ProjectRepository::new(store(path)?))
+}
+
+fn tags(path: &Path) -> Result<TagRepository, CliError> {
+    Ok(TagRepository::new(store(path)?))
+}
+
+fn todos(path: &Path) -> Result<TodoRepository, CliError> {
+    Ok(TodoRepository::new(store(path)?))
 }
 
 fn resolve<'a>(todos: &'a [Todo], token: &str) -> Result<&'a Todo, CliError> {
@@ -285,11 +271,12 @@ fn resolve<'a>(todos: &'a [Todo], token: &str) -> Result<&'a Todo, CliError> {
         })
 }
 
-async fn reopen(repository: PostgresTodoRepository, input: HandleInput) -> Result<(), CliError> {
-    let todos = repository.list().await?;
-    let current = resolve(&todos, &input.handle)?;
+fn reopen(path: &Path, input: &HandleInput) -> Result<(), CliError> {
+    let repository = todos(path)?;
+    let stored = repository.list()?;
+    let current = resolve(&stored, &input.handle)?;
     let replacement = human::reopen(current, human::now())?;
-    repository.replace(current.version(), &replacement).await?;
+    repository.replace(current.version(), &replacement)?;
     if input.json {
         return print_json(&replacement);
     }
@@ -297,7 +284,7 @@ async fn reopen(repository: PostgresTodoRepository, input: HandleInput) -> Resul
     Ok(())
 }
 
-async fn add(repository: PostgresTodoRepository, input: AddInput) -> Result<(), CliError> {
+fn add(path: &Path, input: AddInput) -> Result<(), CliError> {
     let at = human::now();
     let due = match input.due {
         None => None,
@@ -308,7 +295,7 @@ async fn add(repository: PostgresTodoRepository, input: AddInput) -> Result<(), 
         }
     };
     let todo = human::new_todo(input.title, due, at)?;
-    repository.create(&todo).await?;
+    todos(path)?.create(&todo)?;
     if input.json {
         return print_json(&todo);
     }
@@ -316,12 +303,13 @@ async fn add(repository: PostgresTodoRepository, input: AddInput) -> Result<(), 
     Ok(())
 }
 
-async fn edit(repository: PostgresTodoRepository, input: EditInput) -> Result<(), CliError> {
+fn edit(path: &Path, input: EditInput) -> Result<(), CliError> {
     if input.due.is_some() && input.clear_due {
         return Err(CliError::Human(human::HumanError::ConflictingDue));
     }
-    let todos = repository.list().await?;
-    let current = resolve(&todos, &input.handle)?;
+    let repository = todos(path)?;
+    let stored = repository.list()?;
+    let current = resolve(&stored, &input.handle)?;
     let due = match (input.due, input.clear_due) {
         (Some(value), _) => {
             let at = human::now();
@@ -333,7 +321,7 @@ async fn edit(repository: PostgresTodoRepository, input: EditInput) -> Result<()
         (None, false) => human::DueChange::Keep,
     };
     let replacement = human::amend(current, input.title, due, human::now())?;
-    repository.replace(current.version(), &replacement).await?;
+    repository.replace(current.version(), &replacement)?;
     if input.json {
         return print_json(&replacement);
     }
@@ -341,21 +329,21 @@ async fn edit(repository: PostgresTodoRepository, input: EditInput) -> Result<()
     Ok(())
 }
 
-async fn list(repository: PostgresTodoRepository, input: ListInput) -> Result<(), CliError> {
-    let mut todos = repository.list().await?;
+fn list(path: &Path, input: &ListInput) -> Result<(), CliError> {
+    let mut stored = todos(path)?.list()?;
     if !input.all {
-        todos.retain(|todo| todo.lifecycle() == Lifecycle::Open);
+        stored.retain(|todo| todo.lifecycle() == Lifecycle::Open);
     }
     if input.json {
-        return print_json(&todos);
+        return print_json(&stored);
     }
-    if todos.is_empty() {
+    if stored.is_empty() {
         println!("no reminders");
         return Ok(());
     }
     // Undated reminders sort after dated ones, which is the order a day is read in
-    todos.sort_by_key(|todo| (todo.due().is_none(), due_key(todo), todo.title().to_owned()));
-    for todo in &todos {
+    stored.sort_by_key(|todo| (todo.due().is_none(), due_key(todo), todo.title().to_owned()));
+    for todo in &stored {
         println!("{}", human::render(todo));
     }
     Ok(())
@@ -369,15 +357,12 @@ fn due_key(todo: &Todo) -> String {
     }
 }
 
-async fn close(
-    repository: PostgresTodoRepository,
-    lifecycle: Lifecycle,
-    input: HandleInput,
-) -> Result<(), CliError> {
-    let todos = repository.list().await?;
-    let current = resolve(&todos, &input.handle)?;
+fn close(path: &Path, lifecycle: Lifecycle, input: &HandleInput) -> Result<(), CliError> {
+    let repository = todos(path)?;
+    let stored = repository.list()?;
+    let current = resolve(&stored, &input.handle)?;
     let replacement = human::close(current, lifecycle, human::now())?;
-    repository.replace(current.version(), &replacement).await?;
+    repository.replace(current.version(), &replacement)?;
     if input.json {
         return print_json(&replacement);
     }
@@ -385,95 +370,92 @@ async fn close(
     Ok(())
 }
 
-fn database_url(argument: Option<String>) -> Result<DatabaseUrl, CliError> {
+// Where this run keeps its store: the argument, else the environment or config file
+fn database_path(argument: Option<PathBuf>) -> Result<PathBuf, CliError> {
     if let Some(value) = argument {
-        return DatabaseUrl::parse(value).map_err(|_| CliError::Configuration);
+        if value.as_os_str().is_empty() {
+            return Err(CliError::Configuration);
+        }
+        return Ok(value);
     }
     Config::load()
         .map_err(|_| CliError::Configuration)?
-        .database
-        .database_url
-        .ok_or(CliError::Configuration)
+        .database_path()
+        .map_err(|_| CliError::Configuration)
 }
 
-async fn run_project(
-    repository: PostgresProjectRepository,
-    command: ProjectCommand,
-) -> Result<(), CliError> {
+fn run_project(path: &Path, command: ProjectCommand) -> Result<(), CliError> {
     match command {
         ProjectCommand::Create(input) => {
             let project = parse_json::<Project>(&input.json, "project")?;
-            repository.create(&project).await?;
+            projects(path)?.create(&project)?;
             print_json(&project)
         }
         ProjectCommand::Find(input) => {
             let id = ProjectId::from_str(&input.id)
                 .map_err(|_| CliError::InvalidId { kind: "project" })?;
-            let project = repository.find(id).await?.ok_or(CliError::NotFound {
+            let project = projects(path)?.find(id)?.ok_or(CliError::NotFound {
                 kind: "project",
                 id: input.id,
             })?;
             print_json(&project)
         }
-        ProjectCommand::List => print_json(&repository.list().await?),
+        ProjectCommand::List => print_json(&projects(path)?.list()?),
         ProjectCommand::Replace(input) => {
             let expected = version(input.expected_version)?;
             let project = parse_json::<Project>(&input.json, "project")?;
-            repository.replace(expected, &project).await?;
+            projects(path)?.replace(expected, &project)?;
             print_json(&project)
         }
     }
 }
 
-async fn run_tag(repository: PostgresTagRepository, command: TagCommand) -> Result<(), CliError> {
+fn run_tag(path: &Path, command: TagCommand) -> Result<(), CliError> {
     match command {
         TagCommand::Create(input) => {
             let tag = parse_json::<Tag>(&input.json, "tag")?;
-            repository.create(&tag).await?;
+            tags(path)?.create(&tag)?;
             print_json(&tag)
         }
         TagCommand::Find(input) => {
             let id = TagId::from_str(&input.id).map_err(|_| CliError::InvalidId { kind: "tag" })?;
-            let tag = repository.find(id).await?.ok_or(CliError::NotFound {
+            let tag = tags(path)?.find(id)?.ok_or(CliError::NotFound {
                 kind: "tag",
                 id: input.id,
             })?;
             print_json(&tag)
         }
-        TagCommand::List => print_json(&repository.list().await?),
+        TagCommand::List => print_json(&tags(path)?.list()?),
         TagCommand::Replace(input) => {
             let expected = version(input.expected_version)?;
             let tag = parse_json::<Tag>(&input.json, "tag")?;
-            repository.replace(expected, &tag).await?;
+            tags(path)?.replace(expected, &tag)?;
             print_json(&tag)
         }
     }
 }
 
-async fn run_todo(
-    repository: PostgresTodoRepository,
-    command: TodoCommand,
-) -> Result<(), CliError> {
+fn run_todo(path: &Path, command: TodoCommand) -> Result<(), CliError> {
     match command {
         TodoCommand::Create(input) => {
             let todo = parse_json::<Todo>(&input.json, "todo")?;
-            repository.create(&todo).await?;
+            todos(path)?.create(&todo)?;
             print_json(&todo)
         }
         TodoCommand::Find(input) => {
             let id =
                 TodoId::from_str(&input.id).map_err(|_| CliError::InvalidId { kind: "todo" })?;
-            let todo = repository.find(id).await?.ok_or(CliError::NotFound {
+            let todo = todos(path)?.find(id)?.ok_or(CliError::NotFound {
                 kind: "todo",
                 id: input.id,
             })?;
             print_json(&todo)
         }
-        TodoCommand::List => print_json(&repository.list().await?),
+        TodoCommand::List => print_json(&todos(path)?.list()?),
         TodoCommand::Replace(input) => {
             let expected = version(input.expected_version)?;
             let todo = parse_json::<Todo>(&input.json, "todo")?;
-            repository.replace(expected, &todo).await?;
+            todos(path)?.replace(expected, &todo)?;
             print_json(&todo)
         }
     }

@@ -48,7 +48,7 @@ fn unknown_and_invalid_commands_fail_with_stable_clap_errors() {
 
     cargo_bin_cmd!("mg-remindr")
         .args(["project", "find", "not-a-uuid"])
-        .env("MG_REMINDR_DATABASE_URL", "postgres://localhost/mg_todo")
+        .env("MG_REMINDR_DB", "/nonexistent/mg-remindr-test-store.sqlite")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -57,18 +57,15 @@ fn unknown_and_invalid_commands_fail_with_stable_clap_errors() {
 }
 
 #[test]
-fn a_remote_database_url_is_refused_before_any_connection() {
+fn a_store_path_that_names_nothing_is_refused_before_any_work() {
     cargo_bin_cmd!("mg-remindr")
         .args(["migration", "status"])
-        .env(
-            "MG_REMINDR_DATABASE_URL",
-            "postgres://db.example.com/mg_todo",
-        )
+        .env("MG_REMINDR_DB", "")
         .env("XDG_CONFIG_HOME", "/nonexistent/mg-remindr-test-config")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "mg-remindr: invalid database configuration",
+            "a value is required for '--db <DB>'",
         ));
 }
 
@@ -97,13 +94,10 @@ fn the_human_surface_needs_no_json_uuid_version_or_timestamp() {
 }
 
 #[test]
-fn an_unreadable_due_value_fails_before_touching_the_database() {
+fn an_unreadable_due_value_fails_before_touching_the_store() {
     cargo_bin_cmd!("mg-remindr")
         .args(["add", "Nope", "--due", "next thursday"])
-        .env(
-            "MG_REMINDR_DATABASE_URL",
-            "postgres://localhost/mg_todo_absent",
-        )
+        .env("MG_REMINDR_DB", "/nonexistent/mg-remindr-test-store.sqlite")
         .assert()
         .failure()
         .stderr(predicate::str::contains("mg-remindr: due must be today"));
@@ -117,10 +111,7 @@ fn an_unreadable_due_value_fails_before_touching_the_database() {
             "--timezone",
             "Mars/Olympus",
         ])
-        .env(
-            "MG_REMINDR_DATABASE_URL",
-            "postgres://localhost/mg_todo_absent",
-        )
+        .env("MG_REMINDR_DB", "/nonexistent/mg-remindr-test-store.sqlite")
         .assert()
         .failure()
         .stderr(predicate::str::contains(

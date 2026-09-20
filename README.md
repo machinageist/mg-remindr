@@ -1,6 +1,6 @@
 # mg-remindr
 
-`mg-remindr` is the local PostgreSQL todo authority for the Geist suite. It owns
+`mg-remindr` is the local todo authority for the Geist suite, kept in one SQLite file. It owns
 todos, projects, tags, relationships, lifecycle, versions, and the recorded
 transition times behind them, and produces the immutable projection `mg-calr`
 reads for its agenda. Recurrence and reminder delivery have persistence but are
@@ -62,34 +62,31 @@ mg-calr agenda --start 2026-09-04 --end 2026-09-05 --timezone America/New_York
 Only reminders with a due value appear on a day agenda. Completed reminders are
 hidden unless `mg-calr agenda --include-completed` is passed.
 
-## Database
+## The store
 
-Configuration is local-only: a localhost, loopback, or Unix-socket host. With
-nothing configured the authority is `postgresql:///mg_todo?host=/run/postgresql`,
-which expects a peer-authenticated role and database an administrator has already
-provisioned:
+One SQLite file, no server to provision. With nothing configured it is
+`$XDG_DATA_HOME/mg-remindr/remindr.sqlite`, created on first use:
 
 ```bash
-sudo -u postgres createuser --login "$USER"
-sudo -u postgres createdb --owner "$USER" mg_todo
-mg-remindr migration apply  # run unprivileged, not through sudo
+mg-remindr migration apply
 ```
 
-`--database-url`, then `MG_REMINDR_DATABASE_URL`, then
-`$XDG_CONFIG_HOME/mg-remindr/config.toml` override that default. A remote host is
-rejected before any connection is attempted.
+`--db`, then `MG_REMINDR_DB`, then `$XDG_CONFIG_HOME/mg-remindr/config.toml`
+override that default. The file is opened in WAL, with foreign keys on, so a
+reader works while a writer holds it. Every command parses its input before it
+opens the store, so unreadable input never creates one.
 
 ## Development
 
 ```bash
 cargo fmt --all -- --check
 TMPDIR=/dev/shm cargo clippy --all-targets --all-features -- -D warnings
-MG_REMINDR_ALLOW_INTEGRATION_TESTS=1 TMPDIR=/dev/shm cargo test --all-targets
+TMPDIR=/dev/shm cargo test --all-targets
 git diff --check
 ```
 
-The disposable-PostgreSQL suite is opt-in through `MG_REMINDR_ALLOW_INTEGRATION_TESTS=1`
-and starts its own server; leaving it off hides migration and schema regressions.
+The repository tests each take a store in a throwaway directory, so they run
+everywhere with nothing to provision and nothing to opt into.
 
 ## Deferred
 
