@@ -48,7 +48,6 @@ fn unknown_and_invalid_commands_fail_with_stable_clap_errors() {
 
     cargo_bin_cmd!("mg-remindr")
         .args(["project", "find", "not-a-uuid"])
-        .env("MG_REMINDR_DB", "/nonexistent/mg-remindr-test-store.sqlite")
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -97,7 +96,6 @@ fn the_human_surface_needs_no_json_uuid_version_or_timestamp() {
 fn an_unreadable_due_value_fails_before_touching_the_store() {
     cargo_bin_cmd!("mg-remindr")
         .args(["add", "Nope", "--due", "next thursday"])
-        .env("MG_REMINDR_DB", "/nonexistent/mg-remindr-test-store.sqlite")
         .assert()
         .failure()
         .stderr(predicate::str::contains("mg-remindr: due must be today"));
@@ -111,7 +109,6 @@ fn an_unreadable_due_value_fails_before_touching_the_store() {
             "--timezone",
             "Mars/Olympus",
         ])
-        .env("MG_REMINDR_DB", "/nonexistent/mg-remindr-test-store.sqlite")
         .assert()
         .failure()
         .stderr(predicate::str::contains(

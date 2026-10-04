@@ -23,6 +23,8 @@ pub enum ConfigError {
     Parse,
     #[error("database path is empty")]
     EmptyDatabasePath,
+    #[error("database path must be an absolute file in the application data directory")]
+    UnsafeDatabasePath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,11 +80,13 @@ impl Config {
     /// # Errors
     /// Returns an error when the configured path is empty.
     pub fn database_path(&self) -> Result<PathBuf, ConfigError> {
-        self.database
+        let path = self
+            .database
             .path
             .clone()
             .filter(|path| !path.as_os_str().is_empty())
-            .ok_or(ConfigError::EmptyDatabasePath)
+            .ok_or(ConfigError::EmptyDatabasePath)?;
+        approved_database_path(path, &self.paths.data_dir).ok_or(ConfigError::UnsafeDatabasePath)
     }
 
     /// Check that the configured path could name a file.
@@ -115,9 +119,15 @@ impl std::error::Error for RedactedDatabaseError {}
 /// The file used when nothing is configured.
 #[must_use]
 pub fn default_database_path() -> PathBuf {
-    env::var_os(DB_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default_data_dir().join(DEFAULT_DATABASE_FILE))
+    default_data_dir().join(DEFAULT_DATABASE_FILE)
+}
+
+// Accept configured database leaves only inside the application-owned data directory
+fn approved_database_path(candidate: PathBuf, data_dir: &std::path::Path) -> Option<PathBuf> {
+    (candidate.is_absolute()
+        && candidate.file_name().is_some_and(|name| !name.is_empty())
+        && candidate.parent() == Some(data_dir))
+    .then_some(candidate)
 }
 
 impl Paths {
@@ -186,17 +196,31 @@ mod tests {
     }
 
     #[test]
-    fn a_configured_path_is_carried_through() {
+    fn a_configured_path_must_stay_in_the_application_data_directory() {
+        let paths = Paths {
+            config_dir: PathBuf::from("/tmp/config/mg-remindr"),
+            data_dir: PathBuf::from("/tmp/data/mg-remindr"),
+        };
         let config = Config {
             database: DatabaseConfig {
-                path: Some(PathBuf::from("/tmp/elsewhere.sqlite")),
+                path: Some(paths.data_dir.join("alternate.sqlite")),
             },
-            paths: Paths::discover(),
+            paths: paths.clone(),
         };
         assert_eq!(config.validate(), Ok(()));
         assert_eq!(
             config.database_path().unwrap(),
-            PathBuf::from("/tmp/elsewhere.sqlite")
+            paths.data_dir.join("alternate.sqlite")
+        );
+        let unsafe_config = Config {
+            database: DatabaseConfig {
+                path: Some(PathBuf::from("/tmp/elsewhere.sqlite")),
+            },
+            paths,
+        };
+        assert_eq!(
+            unsafe_config.database_path(),
+            Err(ConfigError::UnsafeDatabasePath)
         );
     }
 

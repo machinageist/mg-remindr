@@ -7,11 +7,13 @@
 use std::process::Command;
 use tempfile::TempDir;
 
-// Run one command against the test store and read its JSON
+// Run one command against a store in the test's application data directory and read its JSON
 fn run_cli(store: &TempDir, arguments: &[&str]) -> serde_json::Value {
+    let data_directory = store.path().join("mg-remindr");
     let output = Command::new(env!("CARGO_BIN_EXE_mg-remindr"))
         .args(arguments)
-        .env("MG_REMINDR_DB", store.path().join("remindr.sqlite"))
+        .env("XDG_DATA_HOME", store.path())
+        .env("MG_REMINDR_DB", data_directory.join("remindr.sqlite"))
         .output()
         .unwrap();
     assert!(

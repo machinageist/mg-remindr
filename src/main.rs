@@ -397,16 +397,11 @@ fn adopt(path: &Path, input: &AdoptInput) -> Result<(), CliError> {
 
 // Where this run keeps its store: the argument, else the environment or config file
 fn database_path(argument: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    let mut config = Config::load().map_err(|_| CliError::Configuration)?;
     if let Some(value) = argument {
-        if value.as_os_str().is_empty() {
-            return Err(CliError::Configuration);
-        }
-        return Ok(value);
+        config.database.path = Some(value);
     }
-    Config::load()
-        .map_err(|_| CliError::Configuration)?
-        .database_path()
-        .map_err(|_| CliError::Configuration)
+    config.database_path().map_err(|_| CliError::Configuration)
 }
 
 fn run_project(path: &Path, command: ProjectCommand) -> Result<(), CliError> {

@@ -17,6 +17,7 @@ use crate::{
     reminder::{
         Channel, DeliveryRecord, DeliveryStatus, Reminder, ReminderError, ReminderLifecycle,
     },
+    secure_db,
 };
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use chrono_tz::Tz;
@@ -24,7 +25,6 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -247,12 +247,6 @@ impl Store {
     // Open the file and settle its journal mode without applying anything
     fn attach(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let path = path.into();
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).map_err(|_| StorageError::Connect)?;
-        }
         let store = Self { path };
         let connection = store.conn()?;
         // WAL lets a reader work while a writer holds the file; the mode is stored in the file
@@ -262,12 +256,14 @@ impl Store {
         if !mode.eq_ignore_ascii_case(JOURNAL_MODE_WAL) {
             return Err(StorageError::Connect);
         }
+        secure_db::ensure_database_sidecars(&store.path).map_err(|_| StorageError::Connect)?;
         Ok(store)
     }
 
     // One connection per call, with the pragmas that are not stored in the file
     fn conn(&self) -> Result<Connection, StorageError> {
-        let connection = Connection::open(&self.path).map_err(|_| StorageError::Connect)?;
+        secure_db::prepare_database_path(&self.path).map_err(|_| StorageError::Connect)?;
+        let connection = secure_db::open_database(&self.path).map_err(|_| StorageError::Connect)?;
         connection
             .busy_timeout(BUSY_TIMEOUT)
             .map_err(|_| StorageError::Connect)?;
@@ -1895,6 +1891,56 @@ mod tests {
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
             .unwrap();
         assert_eq!(enforced, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_storage_is_private_repairs_modes_and_rejects_symlinks() {
+        use std::{
+            fs,
+            os::unix::fs::{PermissionsExt, symlink},
+        };
+
+        fn mode(path: &Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("new/remindr.sqlite");
+        let store = Store::open(&path).unwrap();
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert_eq!(mode(&path), 0o600);
+
+        let connection = store.conn().unwrap();
+        connection
+            .execute_batch("CREATE TABLE f03_probe (value INTEGER)")
+            .unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.clone().into_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            assert!(sidecar.is_file(), "SQLite creates {suffix}");
+            assert_eq!(mode(&sidecar), 0o600, "{suffix} is owner-only");
+        }
+
+        let repaired_directory = root.path().join("repaired");
+        fs::create_dir(&repaired_directory).unwrap();
+        fs::set_permissions(&repaired_directory, fs::Permissions::from_mode(0o755)).unwrap();
+        let repaired_path = repaired_directory.join("remindr.sqlite");
+        fs::File::create(&repaired_path).unwrap();
+        fs::set_permissions(&repaired_path, fs::Permissions::from_mode(0o644)).unwrap();
+        Store::open(&repaired_path).unwrap();
+        assert_eq!(mode(&repaired_directory), 0o700);
+        assert_eq!(mode(&repaired_path), 0o600);
+
+        let target = root.path().join("target.sqlite");
+        let link = root.path().join("link.sqlite");
+        symlink(&target, &link).unwrap();
+        assert!(Store::open(&link).is_err());
+        assert!(
+            !target.exists(),
+            "SQLite never follows the protected database leaf"
+        );
     }
 
     #[test]
